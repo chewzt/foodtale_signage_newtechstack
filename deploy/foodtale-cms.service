@@ -1,0 +1,18 @@
+[Unit]
+Description=Foodtale signage CMS
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+EnvironmentFile=-/etc/foodtale/cms.env
+ExecStart=/usr/local/bin/foodtale-cms
+Restart=on-failure
+RestartSec=2
+User=foodtale
+Group=foodtale
+WorkingDirectory=/var/lib/foodtale
+NoNewPrivileges=true
+
+[Install]
+WantedBy=multi-user.target

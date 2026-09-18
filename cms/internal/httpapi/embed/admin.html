@@ -1,0 +1,218 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Foodtale Signage</title>
+  <style>
+    :root { --bg:#f4f1eb; --card:#fff; --ink:#161513; --muted:#6f6a63; --line:#e4dfd6; --accent:#1b5e20; --danger:#b42318; }
+    * { box-sizing: border-box; }
+    body { margin:0; font-family: system-ui, sans-serif; background:var(--bg); color:var(--ink); line-height:1.4; }
+    a { color: var(--accent); }
+    .wrap { max-width: 1100px; margin: 0 auto; padding: 24px 20px 64px; }
+    h1 { margin:0 0 6px; letter-spacing:-0.03em; }
+    .muted, .hint { color: var(--muted); font-size: 13px; }
+    .flash { background:#e8f5e9; color:#1b5e20; padding:10px 16px; margin:0 0 16px; }
+    .flash.err { background:#fdecea; color:var(--danger); }
+    .meta { display:grid; grid-template-columns:repeat(auto-fit,minmax(240px,1fr)); gap:10px; margin:18px 0; }
+    .card { background:var(--card); border:1px solid var(--line); border-radius:12px; padding:14px; margin:12px 0 20px; }
+    nav.jump { display:flex; gap:8px; flex-wrap:wrap; margin: 12px 0 20px; }
+    nav.jump a { background:var(--card); border:1px solid var(--line); border-radius:999px; padding:6px 12px; text-decoration:none; color:var(--ink); font-size:13px; }
+    table { width:100%; border-collapse: collapse; font-size:14px; }
+    th, td { text-align:left; padding:8px 6px; border-bottom:1px solid var(--line); vertical-align:top; }
+    .code { font-family: ui-monospace, monospace; letter-spacing:0.08em; word-break:break-all; }
+    button { background:var(--accent); color:#fff; border:0; border-radius:8px; padding:8px 12px; cursor:pointer; font:inherit; }
+    button.ghost { background:#fff; color:var(--ink); border:1px solid var(--line); }
+    button.danger { background:var(--danger); }
+    form.inline { display:flex; gap:6px; flex-wrap:wrap; align-items:center; }
+    input, select { font:inherit; padding:7px 8px; border:1px solid var(--line); border-radius:8px; }
+    .row { display:flex; gap:8px; flex-wrap:wrap; align-items:end; }
+    .panel { border:1px dashed var(--line); border-radius:10px; padding:10px; margin:8px 0; }
+    video { max-width: 220px; max-height: 124px; background:#000; display:block; margin:8px 0; }
+    .pill { display:inline-block; padding:2px 8px; border-radius:999px; background:#eee; font-size:12px; }
+    .empty { color:var(--muted); text-align:center; padding:16px; }
+  </style>
+</head>
+<body>
+<div class="wrap">
+  {{if .Flash}}<div class="flash">{{.Flash}}</div>{{end}}
+  {{if .Error}}<div class="flash err">{{.Error}}</div>{{end}}
+
+  <h1>Foodtale Signage</h1>
+  <p class="muted">Pi CMS. Pair once, upload short-GOP MP4, Restart sync. Players lock with Media3 on the LAN, not this page.</p>
+
+  <div class="meta">
+    <div class="card">
+      <div class="hint">Server URL</div>
+      <strong>{{.ServerURL}}</strong>
+    </div>
+    <div class="card">
+      <div class="hint">Install APK</div>
+      {{if .APKAvailable}}<a href="{{.APKURL}}">{{.APKURL}}</a>
+      <div class="hint">v{{.APKVersion}}</div>{{else}}<span class="muted">Place foodtale-player.apk in the CMS public dir after you build it.</span>{{end}}
+    </div>
+    <div class="card">
+      <div class="hint">cmsId</div>
+      <span class="code">{{.CMSID}}</span>
+    </div>
+  </div>
+
+  <nav class="jump">
+    <a href="#devices">Devices ({{len .Devices}})</a>
+    <a href="#walls">Walls ({{len .Walls}})</a>
+    <a href="#playlists">Playlists ({{len .Playlists}})</a>
+  </nav>
+
+  <section id="devices">
+    <h2>1. Devices</h2>
+    <div class="card">
+      <form method="post" action="/admin/devices"><button>Create pairing code</button></form>
+      {{if not .Devices}}
+        <p class="empty">No devices yet. Create a pairing code, then pair from the APK.</p>
+      {{else}}
+      <div style="overflow:auto">
+      <table>
+        <tr><th>Name</th><th>Code</th><th>Status</th><th>Seen</th><th>Clock</th><th>Assigned</th><th></th></tr>
+        {{range $d := .Devices}}
+        <tr>
+          <td>{{$d.Name}}</td>
+          <td class="code">{{$d.PairingCode}}</td>
+          <td><span class="pill">{{$d.StatusLabel}}</span></td>
+          <td class="hint">{{$d.SeenLabel}}</td>
+          <td>{{$d.ClockLabel}}</td>
+          <td>{{$d.Assigned}}</td>
+          <td>
+            <form method="post" action="/admin/devices/{{$d.ID}}/assign" class="inline">
+              <select name="playlist_id">
+                <option value="0">— none —</option>
+                {{range $.Targets}}
+                  <option value="{{.ID}}" {{sel (eqInt64 (playlistID $d) .ID)}}>
+                    {{if eq .Kind "carousel"}}[wall {{.PanelCount}}] {{end}}{{.Name}}
+                  </option>
+                {{end}}
+              </select>
+              <select name="panel_index">
+                {{if isCarousel $d}}
+                  {{range seq (panelCount $d)}}
+                    <option value="{{.}}" {{sel (eqInt $d.PanelIndex .)}}>Part {{add . 1}}</option>
+                  {{end}}
+                {{else}}
+                  <option value="0">Fullscreen</option>
+                {{end}}
+              </select>
+              <button class="ghost">Save</button>
+            </form>
+            {{if $d.PlaylistID}}
+            <form method="post" action="/admin/devices/{{$d.ID}}/unassign" class="inline">
+              <button class="ghost">Unassign</button>
+            </form>
+            {{end}}
+            {{if $d.DeviceToken}}
+            <form method="post" action="/admin/devices/{{$d.ID}}/reset" class="inline" onsubmit="return confirm('Reset pairing?')">
+              <button class="ghost">Reset</button>
+            </form>
+            {{end}}
+            <form method="post" action="/admin/devices/{{$d.ID}}/delete" class="inline" onsubmit="return confirm('Delete device?')">
+              <button class="danger">Delete</button>
+            </form>
+          </td>
+        </tr>
+        {{end}}
+      </table>
+      </div>
+      {{end}}
+    </div>
+  </section>
+
+  <section id="walls">
+    <h2>2. Video walls</h2>
+    <div class="card">
+      <form method="post" action="/admin/carousels" class="row">
+        <label>Name<br><input name="name" required placeholder="Lobby wall"></label>
+        <label>Panels<br><input name="panel_count" type="number" min="2" max="8" value="2"></label>
+        <button>Create wall</button>
+      </form>
+    </div>
+    {{if not .Walls}}<p class="empty">No walls yet.</p>{{end}}
+    {{range $wall := .Walls}}
+    <div class="card">
+      <div class="row" style="justify-content:space-between">
+        <div>
+          <strong>{{$wall.Name}}</strong>
+          <span class="pill">wall {{$wall.PanelCount}}</span>
+          <div class="hint">start {{$wall.StartAt}} · gen {{$wall.SyncGeneration}}</div>
+        </div>
+        <div class="row">
+          <form method="post" action="/admin/playlists/{{$wall.ID}}/restart"><button class="ghost">Restart sync</button></form>
+          <form method="post" action="/admin/playlists/{{$wall.ID}}/delete" onsubmit="return confirm('Delete wall?')"><button class="danger">Delete</button></form>
+        </div>
+      </div>
+      {{range $i := seq $wall.PanelCount}}
+      <div class="panel">
+        <div class="hint">Part {{add $i 1}}{{if eq $i 0}} (left){{end}}</div>
+        {{range panelItems $wall $i}}
+          <video src="{{itemURL $.ServerURL .SHA256}}" controls muted></video>
+          <div class="hint">{{.Filename}} · {{.DurationMs}} ms</div>
+          <form method="post" action="/admin/playlists/{{$wall.ID}}/items/{{.ID}}/delete"><button class="ghost">Remove</button></form>
+        {{end}}
+        <form method="post" action="/admin/playlists/{{$wall.ID}}/items" enctype="multipart/form-data" class="row">
+          <input type="hidden" name="panel_index" value="{{$i}}">
+          <input type="file" name="media" accept=".mp4,video/mp4" required>
+          <button>Upload MP4</button>
+        </form>
+      </div>
+      {{end}}
+    </div>
+    {{end}}
+  </section>
+
+  <section id="playlists">
+    <h2>3. Playlists</h2>
+    <div class="card">
+      <form method="post" action="/admin/playlists" class="row">
+        <label>Name<br><input name="name" required placeholder="Lunch loop"></label>
+        <button>Create playlist</button>
+      </form>
+    </div>
+    {{if not .Playlists}}<p class="empty">No playlists yet.</p>{{end}}
+    {{range $pl := .Playlists}}
+    <div class="card">
+      <div class="row" style="justify-content:space-between">
+        <div>
+          <strong>{{$pl.Name}}</strong>
+          <div class="hint">start {{$pl.StartAt}} · gen {{$pl.SyncGeneration}}</div>
+        </div>
+        <div class="row">
+          <form method="post" action="/admin/playlists/{{$pl.ID}}/restart"><button class="ghost">Restart sync</button></form>
+          <form method="post" action="/admin/playlists/{{$pl.ID}}/delete" onsubmit="return confirm('Delete playlist?')"><button class="danger">Delete</button></form>
+        </div>
+      </div>
+      <form method="post" action="/admin/playlists/{{$pl.ID}}/items" enctype="multipart/form-data" class="row">
+        <input type="file" name="media" accept=".mp4,video/mp4" required>
+        <button>Upload MP4</button>
+      </form>
+      {{if not $pl.Items}}<p class="empty">No media.</p>{{end}}
+      {{range $pl.Items}}
+      <div class="row" style="border-top:1px solid var(--line); padding-top:8px; margin-top:8px;">
+        <video src="{{itemURL $.ServerURL .SHA256}}" controls muted></video>
+        <div>
+          <div>{{.Filename}}</div>
+          <div class="hint">{{.DurationMs}} ms · {{.SHA256}}</div>
+        </div>
+        <form method="post" action="/admin/playlists/{{$pl.ID}}/items/{{.ID}}/move" class="inline">
+          <input type="hidden" name="dir" value="up">
+          <button class="ghost">Up</button>
+        </form>
+        <form method="post" action="/admin/playlists/{{$pl.ID}}/items/{{.ID}}/move" class="inline">
+          <input type="hidden" name="dir" value="down">
+          <button class="ghost">Down</button>
+        </form>
+        <form method="post" action="/admin/playlists/{{$pl.ID}}/items/{{.ID}}/delete"><button class="ghost">Remove</button></form>
+      </div>
+      {{end}}
+    </div>
+    {{end}}
+  </section>
+</div>
+</body>
+</html>

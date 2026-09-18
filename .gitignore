@@ -1,0 +1,25 @@
+# CMS
+cms/foodtale-cms
+cms/data/
+*.db
+*.db-wal
+*.db-shm
+
+# Android
+player/.gradle/
+player/build/
+player/app/build/
+player/local.properties
+*.apk
+*.aab
+*.ap_
+*.dex
+.idea/
+*.iml
+captures/
+
+# OS
+.DS_Store
+*.log
+.env
+cms.env
