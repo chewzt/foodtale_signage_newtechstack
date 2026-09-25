@@ -25,6 +25,10 @@ func main() {
 	}
 	defer st.Close()
 
+	if err := httpapi.RestartAll(st); err != nil {
+		log.Fatal(err)
+	}
+
 	log.Printf("foodtale cms id=%s data=%s", cfg.CMSID, cfg.DataDir)
 	log.Printf("admin %s  clock udp :%d  beacon udp :%d", cfg.AdvertiseURL(), cfg.ClockPort, cfg.BeaconPort)
 	go func() {

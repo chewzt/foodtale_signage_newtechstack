@@ -39,8 +39,12 @@ class CmsApi {
         }
     }
 
-    fun manifest(base: String, token: String, offsetMs: Long, rttMs: Long): Manifest? {
-        val url = "${base.trimEnd('/')}/api/device/manifest?clock_offset_ms=$offsetMs&clock_rtt_ms=$rttMs"
+    fun manifest(base: String, token: String, offsetMs: Long, rttMs: Long, status: String = ""): Manifest? {
+        val query = buildString {
+            append("clock_offset_ms=$offsetMs&clock_rtt_ms=$rttMs")
+            if (status.isNotBlank()) append("&").append(status)
+        }
+        val url = "${base.trimEnd('/')}/api/device/manifest?$query"
         val reqBuilder = Request.Builder()
             .url(url)
             .header("Authorization", "Bearer $token")
@@ -54,7 +58,16 @@ class CmsApi {
             val body = resp.body?.string().orEmpty()
             if (!resp.isSuccessful) error(body.ifBlank { "manifest ${resp.code}" })
             resp.header("ETag")?.let { Prefs.etag(it) }
-            return parseManifest(JSONObject(body))
+            return Manifest.fromJson(JSONObject(body))
+        }
+    }
+
+    fun parseCached(raw: String): Manifest? {
+        if (raw.isBlank()) return null
+        return try {
+            Manifest.fromJson(JSONObject(raw))
+        } catch (_: Exception) {
+            null
         }
     }
 
@@ -90,49 +103,5 @@ class CmsApi {
             tmp.copyTo(dest, overwrite = true)
             tmp.delete()
         }
-    }
-
-    private fun parseManifest(j: JSONObject): Manifest {
-        val peers = j.optJSONArray("peers")
-        val peerList = mutableListOf<Peer>()
-        if (peers != null) {
-            for (i in 0 until peers.length()) {
-                val p = peers.getJSONObject(i)
-                peerList.add(Peer(p.optLong("id"), p.optString("name"), p.optString("ip")))
-            }
-        }
-        val items = j.optJSONArray("items")
-        val itemList = mutableListOf<MediaItem>()
-        if (items != null) {
-            for (i in 0 until items.length()) {
-                val it = items.getJSONObject(i)
-                itemList.add(
-                    MediaItem(
-                        id = it.optLong("id"),
-                        type = it.optString("type"),
-                        url = it.optString("url"),
-                        sha256 = it.optString("sha256"),
-                        durationMs = it.optInt("duration_ms", 10_000),
-                        fit = it.optString("fit", "cut"),
-                        fileDurationMs = it.optInt("file_duration_ms", it.optInt("duration_ms", 10_000)),
-                    )
-                )
-            }
-        }
-        return Manifest(
-            playlistName = j.optString("playlist_name"),
-            playlistId = j.optLong("playlist_id"),
-            deviceId = j.optLong("device_id"),
-            cmsId = j.optString("cms_id"),
-            kind = j.optString("kind", "playlist"),
-            panelCount = j.optInt("panel_count", 1),
-            panelIndex = j.optInt("panel_index", 0),
-            peerCount = j.optInt("peer_count", 1),
-            peers = peerList,
-            startAt = j.optString("start_at"),
-            startMasterMs = j.optLong("start_master_ms"),
-            syncGeneration = j.optLong("sync_generation"),
-            items = itemList,
-        )
     }
 }

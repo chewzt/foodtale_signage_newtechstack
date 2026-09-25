@@ -146,8 +146,10 @@ class MainActivity : AppCompatActivity() {
             true
         }
         val view = findViewById<PlayerView>(R.id.playerView)
+        val preload = findViewById<PlayerView>(R.id.preloadView)
         view.useController = false
         view.resizeMode = AspectRatioFrameLayout.RESIZE_MODE_ZOOM
+        preload.useController = false
         engine?.release()
         val eng = PlayerEngine(
             this,
@@ -155,7 +157,7 @@ class MainActivity : AppCompatActivity() {
             onReady = { session?.onReady() },
         )
         engine = eng
-        view.player = eng.player
+        eng.attach(view, preload)
         bus?.stop()
         val playBus = PlayBus(this) { msg -> main.post { session?.onPlayMsg(msg) } }
         playBus.start()
@@ -164,6 +166,8 @@ class MainActivity : AppCompatActivity() {
         session = WallSession(eng, clock, playBus, api, cache) { line ->
             main.post { hud.text = listOf(line, updateHint).filter { it.isNotBlank() }.joinToString("\n") }
         }
+        clock.restore()
+        api.parseCached(Prefs.manifestJson())?.let { session?.applyManifest(it) }
         beacon = BeaconListener { b ->
             if (Prefs.cmsId().isNotBlank() && b.cmsId != Prefs.cmsId()) return@BeaconListener
             if (!httpOk || Prefs.http() != b.http) {
@@ -185,7 +189,12 @@ class MainActivity : AppCompatActivity() {
                 val now = System.currentTimeMillis()
                 try {
                     val playing = session?.playing == true
-                    val clockEveryMs = if (playing) 5000L else 1000L
+                    val settling = session?.settling == true
+                    val clockEveryMs = when {
+                        playing -> 8000L
+                        settling -> 250L
+                        else -> 1000L
+                    }
                     if (Prefs.http().isNotBlank() && now - lastClock >= clockEveryMs) {
                         lastClock = now
                         try {
@@ -197,7 +206,13 @@ class MainActivity : AppCompatActivity() {
                     }
                     if (Prefs.http().isNotBlank() && Prefs.paired() && n % 2 == 0) {
                         try {
-                            val man = api.manifest(Prefs.http(), Prefs.token(), clock.offsetMs, clock.rttMs)
+                            val man = api.manifest(
+                                Prefs.http(),
+                                Prefs.token(),
+                                clock.offsetMs,
+                                clock.rttMs,
+                                session?.statusQuery().orEmpty(),
+                            )
                             httpOk = true
                             if (man != null) {
                                 if (man.cmsId.isNotBlank() && man.cmsId != Prefs.cmsId()) {

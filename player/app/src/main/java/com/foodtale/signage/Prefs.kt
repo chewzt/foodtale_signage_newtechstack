@@ -37,6 +37,16 @@ object Prefs {
     fun etag(): String = p.getString("etag", "") ?: ""
     fun etag(v: String) { p.edit().putString("etag", v).apply() }
 
+    fun manifestJson(): String = p.getString("manifestJson", "") ?: ""
+    fun manifestJson(v: String) { p.edit().putString("manifestJson", v).apply() }
+
+    fun clockOffset(): Long = p.getLong("clockOffset", 0)
+    fun clockRtt(): Long = p.getLong("clockRtt", 0)
+    fun hasClock(): Boolean = p.contains("clockOffset")
+    fun saveClock(offset: Long, rtt: Long) {
+        p.edit().putLong("clockOffset", offset).putLong("clockRtt", rtt).apply()
+    }
+
     fun paired(): Boolean = token().isNotBlank() && cmsId().isNotBlank()
 
     fun clearPair() {
