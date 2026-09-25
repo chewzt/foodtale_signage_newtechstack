@@ -4,6 +4,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"io"
+	"log"
 	"net/http"
 	"os"
 	"path/filepath"
@@ -240,18 +241,37 @@ func (s *Server) deletePlaylist(w http.ResponseWriter, r *http.Request) {
 
 func (s *Server) restartSync(w http.ResponseWriter, r *http.Request) {
 	id, _ := strconv.ParseInt(chi.URLParam(r, "id"), 10, 64)
-	delay := 8 * time.Second
-	master := clock.MasterNowMs() + delay.Milliseconds()
+	if err := RestartSync(s.st, id); err != nil {
+		redirect(w, r, "/admin?err="+urlErr(err))
+		return
+	}
+	redirect(w, r, "/admin?ok=restart+sync")
+}
+
+// RestartAll runs the admin Restart sync button for every playlist.
+// Called when the process starts, so a Pi reboot does not leave the old boot clock in the future.
+func RestartAll(st *store.Store) error {
+	playlists, err := st.AllPlaylists()
+	if err != nil {
+		return err
+	}
+	for _, pl := range playlists {
+		if err := RestartSync(st, pl.ID); err != nil {
+			return err
+		}
+		log.Printf("restart sync playlist=%d name=%s", pl.ID, pl.Name)
+	}
+	return nil
+}
+
+func RestartSync(st *store.Store, id int64) error {
+	master := clock.MasterNowMs() + (8 * time.Second).Milliseconds()
 	if rem := master % 1000; rem != 0 {
 		master += 1000 - rem
 	}
 	wait := time.Duration(master-clock.MasterNowMs()) * time.Millisecond
 	startAt := time.Now().UTC().Add(wait).Format(time.RFC3339Nano)
-	if err := s.st.RestartSync(id, startAt, master); err != nil {
-		redirect(w, r, "/admin?err="+urlErr(err))
-		return
-	}
-	redirect(w, r, "/admin?ok=restart+sync")
+	return st.RestartSync(id, startAt, master)
 }
 
 func redirect(w http.ResponseWriter, r *http.Request, loc string) {

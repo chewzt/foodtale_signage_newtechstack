@@ -43,7 +43,15 @@ class ClockClient(
             offsetMs = ((tMaster - t1) + (t2send - t3)) / 2
             rttMs = t3 - t1
             lastOkAt = t3
+            Prefs.saveClock(offsetMs, rttMs)
         }
+    }
+
+    fun restore() {
+        if (!Prefs.hasClock()) return
+        offsetMs = Prefs.clockOffset()
+        rttMs = Prefs.clockRtt()
+        lastOkAt = SystemClock.elapsedRealtime()
     }
 
     companion object {
