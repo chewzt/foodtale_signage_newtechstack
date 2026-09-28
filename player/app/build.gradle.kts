@@ -11,8 +11,20 @@ android {
         applicationId = "com.foodtale.signage"
         minSdk = 24
         targetSdk = 35
-        versionCode = 25
-        versionName = "0.2.24"
+        versionCode = 27
+        versionName = "0.2.26"
+    }
+
+    flavorDimensions += "role"
+    productFlavors {
+        create("player") {
+            dimension = "role"
+            buildConfigField("boolean", "START_CMS", "false")
+        }
+        create("cms") {
+            dimension = "role"
+            buildConfigField("boolean", "START_CMS", "true")
+        }
     }
 
     signingConfigs {
@@ -41,6 +53,35 @@ android {
     buildFeatures {
         viewBinding = false
         buildConfig = true
+    }
+    packaging {
+        jniLibs {
+            useLegacyPackaging = true
+        }
+    }
+}
+
+val cmsDir = rootProject.layout.projectDirectory.dir("../cms")
+val cmsArm = layout.projectDirectory.file("src/cms/jniLibs/armeabi-v7a/libfoodtale_cms.so")
+val cmsArm64 = layout.projectDirectory.file("src/cms/jniLibs/arm64-v8a/libfoodtale_cms.so")
+val buildCms = tasks.register<Exec>("buildCms") {
+    workingDir(cmsDir)
+    commandLine(
+        "bash", "-c",
+        """
+        set -e
+        mkdir -p '${cmsArm.asFile.parent}' '${cmsArm64.asFile.parent}'
+        CGO_ENABLED=0 GOOS=linux GOARCH=arm go build -o '${cmsArm.asFile.absolutePath}' .
+        CGO_ENABLED=0 GOOS=linux GOARCH=arm64 go build -o '${cmsArm64.asFile.absolutePath}' .
+        """.trimIndent()
+    )
+    outputs.files(cmsArm, cmsArm64)
+    inputs.dir(cmsDir.dir("internal"))
+    inputs.file(cmsDir.file("main.go"))
+}
+tasks.configureEach {
+    if (name == "preCmsDebugBuild" || name == "preCmsReleaseBuild") {
+        dependsOn(buildCms)
     }
 }
 

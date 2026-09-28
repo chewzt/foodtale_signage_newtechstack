@@ -9,5 +9,5 @@ func platformNowMs() int64 {
 	if err := unix.ClockGettime(unix.CLOCK_BOOTTIME, &ts); err != nil {
 		_ = unix.ClockGettime(unix.CLOCK_MONOTONIC, &ts)
 	}
-	return ts.Sec*1000 + int64(ts.Nsec)/1_000_000
+	return int64(ts.Sec)*1000 + int64(ts.Nsec)/1_000_000
 }

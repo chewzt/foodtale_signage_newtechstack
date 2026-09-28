@@ -11,6 +11,8 @@ player/build/
 player/app/build/
 player/local.properties
 *.apk
+player/app/src/main/jniLibs/
+player/app/src/cms/jniLibs/
 *.aab
 *.ap_
 *.dex

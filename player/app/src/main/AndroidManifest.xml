@@ -23,6 +23,7 @@
         android:banner="@android:drawable/ic_media_play"
         android:supportsRtl="true"
         android:theme="@style/Theme.Foodtale"
+        android:extractNativeLibs="true"
         android:usesCleartextTraffic="true">
 
         <activity
