@@ -20,6 +20,7 @@ type Config struct {
 	DataDir        string
 	AdminPassword  string
 	AdvertiseHost  string
+	DMSPublicURL   string
 }
 
 func Load() (*Config, error) {
@@ -31,6 +32,7 @@ func Load() (*Config, error) {
 		DataDir:       env("DATA_DIR", defaultDataDir()),
 		AdminPassword: env("ADMIN_PASSWORD", ""),
 		AdvertiseHost: env("HTTP_ADVERTISE", ""),
+		DMSPublicURL:  strings.TrimRight(env("DMS_PUBLIC_URL", ""), "/"),
 	}
 	if err := os.MkdirAll(cfg.MediaDir(), 0o755); err != nil {
 		return nil, err

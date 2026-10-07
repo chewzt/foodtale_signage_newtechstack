@@ -39,6 +39,10 @@ func Listen(cfg *config.Config, st *store.Store) error {
 	r.Get("/api/health", s.health)
 	r.Get("/api/app/version", s.appVersion)
 	r.Post("/api/pair", s.pair)
+	r.Get("/api/claim/head", s.claimHead)
+	r.Post("/api/claim/screen", s.claimScreen)
+	r.Post("/api/claim/adopt", s.adoptClaim)
+	r.Post("/api/claim/join", s.joinClaim)
 	r.Get("/api/device/manifest", s.manifest)
 	r.Post("/api/device/heartbeat", s.heartbeat)
 
@@ -65,6 +69,8 @@ func Listen(cfg *config.Config, st *store.Store) error {
 		r.Post("/admin/playlists/{id}/delete", s.deletePlaylist)
 		r.Post("/admin/playlists/{id}/restart", s.restartSync)
 	})
+
+	go s.watchRevokes()
 
 	srv := &http.Server{
 		Addr:              cfg.HTTPAddr(),
@@ -225,7 +231,16 @@ func (s *Server) manifestBody(d *store.Device) map[string]any {
 		panelIndex = panelCount - 1
 	}
 	items := pl.Items
-	if pl.IsCarousel() {
+	if choice, err := s.st.DmsChoiceSHA(d.ID); err == nil && choice != "" {
+		filtered := make([]store.Item, 0, 1)
+		for _, it := range items {
+			if it.SHA256 == choice {
+				filtered = append(filtered, it)
+			}
+		}
+		items = filtered
+	}
+	if pl.IsCarousel() || itemsHavePanels(items) {
 		var filtered []store.Item
 		for _, it := range items {
 			if it.PanelIndex != nil && *it.PanelIndex == panelIndex {
@@ -247,6 +262,10 @@ func (s *Server) manifestBody(d *store.Device) map[string]any {
 		})
 	}
 	peers, _ := s.st.Peers(pl.ID, d.ID)
+	leaderID := int64(0)
+	if head, err := s.st.DmsClaimByRole("head"); err == nil && head != nil && head.Claimed {
+		leaderID = head.LocalDeviceID
+	}
 	return map[string]any{
 		"playlist_name":   pl.Name,
 		"playlist_id":     pl.ID,
@@ -257,11 +276,21 @@ func (s *Server) manifestBody(d *store.Device) map[string]any {
 		"panel_index":     panelIndex,
 		"peer_count":      len(peers),
 		"peers":           peers,
+		"leader_id":       leaderID,
 		"start_at":        pl.StartAt,
 		"start_master_ms": pl.StartMasterMs,
 		"sync_generation": pl.SyncGeneration,
 		"items":           mapped,
 	}
+}
+
+func itemsHavePanels(items []store.Item) bool {
+	for _, it := range items {
+		if it.PanelIndex != nil {
+			return true
+		}
+	}
+	return false
 }
 
 func (s *Server) heartbeat(w http.ResponseWriter, r *http.Request) {

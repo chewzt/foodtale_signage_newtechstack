@@ -132,7 +132,82 @@ CREATE INDEX IF NOT EXISTS items_playlist ON items(playlist_id, sort_order);
 		return err
 	}
 	_, _ = s.db.Exec(`ALTER TABLE devices ADD COLUMN last_ip TEXT NOT NULL DEFAULT ''`)
-	return nil
+	_, err = s.db.Exec(`
+CREATE TABLE IF NOT EXISTS dms_claims (
+  local_device_id INTEGER PRIMARY KEY,
+  role TEXT NOT NULL,
+  code TEXT NOT NULL,
+  claimed INTEGER NOT NULL DEFAULT 0
+);
+CREATE TABLE IF NOT EXISTS dms_playback (
+  dms_playlist_id INTEGER NOT NULL,
+  media_asset_id INTEGER NOT NULL DEFAULT 0,
+  generation INTEGER NOT NULL,
+  local_playlist_id INTEGER NOT NULL,
+  PRIMARY KEY (dms_playlist_id, media_asset_id)
+);
+CREATE TABLE IF NOT EXISTS dms_media (
+  dms_playlist_id INTEGER NOT NULL,
+  media_asset_id INTEGER NOT NULL,
+  sha256 TEXT NOT NULL,
+  PRIMARY KEY (dms_playlist_id, media_asset_id)
+);
+CREATE TABLE IF NOT EXISTS dms_choice (
+  local_device_id INTEGER PRIMARY KEY,
+  media_asset_id INTEGER NOT NULL DEFAULT 0,
+  sha256 TEXT NOT NULL DEFAULT ''
+);
+`)
+	if err != nil {
+		return err
+	}
+	return s.rebuildPlaybackIfNeeded()
+}
+
+func (s *Store) rebuildPlaybackIfNeeded() error {
+	rows, err := s.db.Query(`PRAGMA table_info(dms_playback)`)
+	if err != nil {
+		return err
+	}
+	defer rows.Close()
+	hasMedia := false
+	for rows.Next() {
+		var cid, notnull, pk int
+		var name, ctype string
+		var dflt sql.NullString
+		if err := rows.Scan(&cid, &name, &ctype, &notnull, &dflt, &pk); err != nil {
+			return err
+		}
+		if name == "media_asset_id" {
+			hasMedia = true
+		}
+	}
+	if err := rows.Err(); err != nil {
+		return err
+	}
+	if hasMedia {
+		return nil
+	}
+	if _, err := s.db.Exec(`ALTER TABLE dms_playback RENAME TO dms_playback_old`); err != nil {
+		return err
+	}
+	if _, err := s.db.Exec(`
+CREATE TABLE dms_playback (
+  dms_playlist_id INTEGER NOT NULL,
+  media_asset_id INTEGER NOT NULL DEFAULT 0,
+  generation INTEGER NOT NULL,
+  local_playlist_id INTEGER NOT NULL,
+  PRIMARY KEY (dms_playlist_id, media_asset_id)
+)`); err != nil {
+		return err
+	}
+	if _, err := s.db.Exec(`
+INSERT INTO dms_playback(dms_playlist_id, media_asset_id, generation, local_playlist_id)
+SELECT dms_playlist_id, 0, generation, local_playlist_id FROM dms_playback_old`); err != nil {
+		return err
+	}
+	_, err = s.db.Exec(`DROP TABLE dms_playback_old`)
+	return err
 }
 
 func nowRFC() string {
@@ -153,6 +228,14 @@ func (s *Store) CreatePlaylist(name, kind string, panelCount int) (*Playlist, er
 	}
 	id, _ := res.LastInsertId()
 	return s.Playlist(id)
+}
+
+func (s *Store) SetPanelCount(id int64, count int) error {
+	if count < 1 {
+		count = 1
+	}
+	_, err := s.db.Exec(`UPDATE playlists SET panel_count=? WHERE id=?`, count, id)
+	return err
 }
 
 func (s *Store) Playlist(id int64) (*Playlist, error) {
@@ -244,6 +327,15 @@ func (s *Store) RestartSync(id int64, startAt string, startMasterMs int64) error
 	return err
 }
 
+func (s *Store) ItemFilename(id int64) (string, error) {
+	var name string
+	err := s.db.QueryRow(`SELECT filename FROM items WHERE id=?`, id).Scan(&name)
+	if err == sql.ErrNoRows {
+		return "", nil
+	}
+	return name, err
+}
+
 func (s *Store) Items(playlistID int64) ([]Item, error) {
 	rows, err := s.db.Query(
 		`SELECT id, playlist_id, type, sha256, filename, duration_ms, file_duration_ms, fit, sort_order, panel_index
@@ -290,6 +382,126 @@ func (s *Store) AddItem(it Item) (int64, error) {
 
 func (s *Store) DeleteItem(id int64) error {
 	_, err := s.db.Exec(`DELETE FROM items WHERE id=?`, id)
+	return err
+}
+
+func (s *Store) ReplaceItems(playlistID int64, items []Item) error {
+	tx, err := s.db.Begin()
+	if err != nil {
+		return err
+	}
+	defer tx.Rollback()
+	if _, err := tx.Exec(`DELETE FROM items WHERE playlist_id=?`, playlistID); err != nil {
+		return err
+	}
+	for _, it := range items {
+		var panel any
+		if it.PanelIndex != nil {
+			panel = *it.PanelIndex
+		}
+		if _, err := tx.Exec(
+			`INSERT INTO items(playlist_id, type, sha256, filename, duration_ms, file_duration_ms, fit, sort_order, panel_index, created_at)
+			 VALUES(?,?,?,?,?,?,?,?,?,?)`,
+			playlistID, it.Type, it.SHA256, it.Filename, it.DurationMs, it.FileDurationMs, it.Fit, it.SortOrder, panel, nowRFC(),
+		); err != nil {
+			return err
+		}
+	}
+	return tx.Commit()
+}
+
+func (s *Store) RenamePlaylist(id int64, name string) error {
+	_, err := s.db.Exec(`UPDATE playlists SET name=? WHERE id=?`, name, id)
+	return err
+}
+
+func (s *Store) DmsLocalPlaylist(dmsPlaylistID, mediaAssetID int64) (generation int, localID int64, ok bool, err error) {
+	err = s.db.QueryRow(
+		`SELECT generation, local_playlist_id FROM dms_playback WHERE dms_playlist_id=? AND media_asset_id=?`,
+		dmsPlaylistID, mediaAssetID,
+	).Scan(&generation, &localID)
+	if err == sql.ErrNoRows {
+		return 0, 0, false, nil
+	}
+	if err != nil {
+		return 0, 0, false, err
+	}
+	return generation, localID, true, nil
+}
+
+func (s *Store) ReplaceDmsMedia(dmsPlaylistID int64, files map[int64]string) error {
+	tx, err := s.db.Begin()
+	if err != nil {
+		return err
+	}
+	defer tx.Rollback()
+	for mediaID, sha := range files {
+		if mediaID <= 0 || sha == "" {
+			continue
+		}
+		if _, err := tx.Exec(
+			`INSERT INTO dms_media(dms_playlist_id, media_asset_id, sha256) VALUES(?,?,?)
+			 ON CONFLICT(dms_playlist_id, media_asset_id) DO UPDATE SET sha256=excluded.sha256`,
+			dmsPlaylistID, mediaID, sha,
+		); err != nil {
+			return err
+		}
+	}
+	return tx.Commit()
+}
+
+func (s *Store) DmsMediaSHA(dmsPlaylistID, mediaAssetID int64) (string, bool, error) {
+	var sha string
+	err := s.db.QueryRow(
+		`SELECT sha256 FROM dms_media WHERE dms_playlist_id=? AND media_asset_id=?`,
+		dmsPlaylistID, mediaAssetID,
+	).Scan(&sha)
+	if err == sql.ErrNoRows {
+		return "", false, nil
+	}
+	if err != nil {
+		return "", false, err
+	}
+	return sha, true, nil
+}
+
+func (s *Store) DmsMediaCovers(dmsPlaylistID int64, mediaIDs []int64) (bool, error) {
+	for _, id := range mediaIDs {
+		if id <= 0 {
+			continue
+		}
+		_, ok, err := s.DmsMediaSHA(dmsPlaylistID, id)
+		if err != nil || !ok {
+			return false, err
+		}
+	}
+	return true, nil
+}
+
+func (s *Store) SaveDmsChoice(deviceID, mediaAssetID int64, sha string) error {
+	_, err := s.db.Exec(
+		`INSERT INTO dms_choice(local_device_id, media_asset_id, sha256) VALUES(?,?,?)
+		 ON CONFLICT(local_device_id) DO UPDATE SET media_asset_id=excluded.media_asset_id, sha256=excluded.sha256`,
+		deviceID, mediaAssetID, sha,
+	)
+	return err
+}
+
+func (s *Store) DmsChoiceSHA(deviceID int64) (string, error) {
+	var sha string
+	err := s.db.QueryRow(`SELECT sha256 FROM dms_choice WHERE local_device_id=?`, deviceID).Scan(&sha)
+	if err == sql.ErrNoRows {
+		return "", nil
+	}
+	return sha, err
+}
+
+func (s *Store) SaveDmsPlayback(dmsPlaylistID, mediaAssetID int64, generation int, localID int64) error {
+	_, err := s.db.Exec(
+		`INSERT INTO dms_playback(dms_playlist_id, media_asset_id, generation, local_playlist_id) VALUES(?,?,?,?)
+		 ON CONFLICT(dms_playlist_id, media_asset_id) DO UPDATE SET generation=excluded.generation, local_playlist_id=excluded.local_playlist_id`,
+		dmsPlaylistID, mediaAssetID, generation, localID,
+	)
 	return err
 }
 
@@ -624,6 +836,93 @@ func valueOr(p *int, fallback int) int {
 		return fallback
 	}
 	return *p
+}
+
+type DmsClaim struct {
+	LocalDeviceID int64
+	Role          string
+	Code          string
+	Claimed       bool
+}
+
+func (s *Store) PrepareClaimDevice(name string) (*Device, error) {
+	dev, err := s.CreatePairingCode()
+	if err != nil {
+		return nil, err
+	}
+	return s.Pair(dev.PairingCode, name)
+}
+
+func (s *Store) NewClaimCode() (string, error) {
+	return pairingCode()
+}
+
+func (s *Store) SaveDmsClaim(claim DmsClaim) error {
+	claimed := 0
+	if claim.Claimed {
+		claimed = 1
+	}
+	_, err := s.db.Exec(
+		`INSERT INTO dms_claims(local_device_id, role, code, claimed) VALUES(?,?,?,?)
+		 ON CONFLICT(local_device_id) DO UPDATE SET role=excluded.role, code=excluded.code, claimed=excluded.claimed`,
+		claim.LocalDeviceID, claim.Role, claim.Code, claimed,
+	)
+	return err
+}
+
+func (s *Store) DmsClaimByCode(code string) (*DmsClaim, error) {
+	row := s.db.QueryRow(`SELECT local_device_id, role, code, claimed FROM dms_claims WHERE code=?`, code)
+	return scanDmsClaim(row.Scan)
+}
+
+func (s *Store) DmsClaimByRole(role string) (*DmsClaim, error) {
+	row := s.db.QueryRow(`SELECT local_device_id, role, code, claimed FROM dms_claims WHERE role=? ORDER BY local_device_id LIMIT 1`, role)
+	return scanDmsClaim(row.Scan)
+}
+
+func (s *Store) DmsClaims() ([]DmsClaim, error) {
+	rows, err := s.db.Query(`SELECT local_device_id, role, code, claimed FROM dms_claims`)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	var out []DmsClaim
+	for rows.Next() {
+		claim, err := scanDmsClaim(rows.Scan)
+		if err != nil {
+			return nil, err
+		}
+		if claim != nil {
+			out = append(out, *claim)
+		}
+	}
+	if out == nil {
+		out = []DmsClaim{}
+	}
+	return out, rows.Err()
+}
+
+func (s *Store) ClearDeviceToken(id int64) error {
+	_, err := s.db.Exec(`UPDATE devices SET device_token=NULL, status='pending' WHERE id=?`, id)
+	return err
+}
+
+func (s *Store) DmsClaimByDevice(id int64) (*DmsClaim, error) {
+	row := s.db.QueryRow(`SELECT local_device_id, role, code, claimed FROM dms_claims WHERE local_device_id=?`, id)
+	return scanDmsClaim(row.Scan)
+}
+
+func scanDmsClaim(scan func(dest ...any) error) (*DmsClaim, error) {
+	var claim DmsClaim
+	var claimed int
+	if err := scan(&claim.LocalDeviceID, &claim.Role, &claim.Code, &claimed); err != nil {
+		if err == sql.ErrNoRows {
+			return nil, nil
+		}
+		return nil, err
+	}
+	claim.Claimed = claimed != 0
+	return &claim, nil
 }
 
 func pairingCode() (string, error) {

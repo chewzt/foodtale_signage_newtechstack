@@ -47,6 +47,24 @@ object Prefs {
         p.edit().putLong("clockOffset", offset).putLong("clockRtt", rtt).apply()
     }
 
+    fun claimCode(): String = p.getString("claimCode", "") ?: ""
+    fun claimCode(v: String) { p.edit().putString("claimCode", v.trim().uppercase()).apply() }
+
+    fun headDeviceId(): Long = p.getLong("headDeviceId", 0)
+    fun headDeviceId(v: Long) { p.edit().putLong("headDeviceId", v).apply() }
+
+    fun followedHeadId(): Long = p.getLong("followedHeadId", 0)
+    fun followedHeadId(v: Long) { p.edit().putLong("followedHeadId", v).apply() }
+
+    fun installationId(): String {
+        var id = p.getString("installationId", "") ?: ""
+        if (id.isBlank()) {
+            id = java.util.UUID.randomUUID().toString().replace("-", "")
+            p.edit().putString("installationId", id).apply()
+        }
+        return id
+    }
+
     fun paired(): Boolean = token().isNotBlank() && cmsId().isNotBlank()
 
     fun clearPair() {

@@ -37,9 +37,14 @@ data class Manifest(
     val startMasterMs: Long,
     val syncGeneration: Long,
     val items: List<MediaItem>,
+    val leaderIdHint: Long = 0,
 ) {
     val group: String get() = "p$playlistId|$syncGeneration"
-    val leaderId: Long get() = peers.minOfOrNull { it.id } ?: deviceId
+    val leaderId: Long
+        get() {
+            if (leaderIdHint != 0L && peers.any { it.id == leaderIdHint }) return leaderIdHint
+            return peers.minOfOrNull { it.id } ?: deviceId
+        }
     val isLeader: Boolean get() = deviceId == leaderId
 
     fun toJson(): JSONObject {
@@ -75,6 +80,7 @@ data class Manifest(
             .put("panel_index", panelIndex)
             .put("peer_count", peerCount)
             .put("peers", peerArr)
+            .put("leader_id", leaderIdHint)
             .put("start_at", startAt)
             .put("start_master_ms", startMasterMs)
             .put("sync_generation", syncGeneration)
@@ -123,6 +129,7 @@ data class Manifest(
                 startMasterMs = j.optLong("start_master_ms"),
                 syncGeneration = j.optLong("sync_generation"),
                 items = itemList,
+                leaderIdHint = j.optLong("leader_id"),
             )
         }
     }

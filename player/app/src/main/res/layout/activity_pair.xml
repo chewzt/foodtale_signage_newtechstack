@@ -1,62 +1,68 @@
 <?xml version="1.0" encoding="utf-8"?>
-<ScrollView xmlns:android="http://schemas.android.com/apk/res/android"
+<LinearLayout xmlns:android="http://schemas.android.com/apk/res/android"
     android:layout_width="match_parent"
     android:layout_height="match_parent"
     android:background="#F4F1EB"
-    android:fillViewport="true">
+    android:orientation="horizontal"
+    android:padding="32dp">
 
     <LinearLayout
-        android:layout_width="match_parent"
-        android:layout_height="wrap_content"
+        android:layout_width="0dp"
+        android:layout_height="match_parent"
+        android:layout_weight="1"
+        android:gravity="center_vertical"
         android:orientation="vertical"
-        android:padding="24dp">
+        android:paddingEnd="24dp">
 
         <TextView
             android:layout_width="wrap_content"
             android:layout_height="wrap_content"
-            android:text="Foodtale Signage"
+            android:text="Foodtale"
             android:textColor="#161513"
-            android:textSize="24sp"
+            android:textSize="28sp"
             android:textStyle="bold" />
+
+        <TextView
+            android:id="@+id/claimInstructions"
+            android:layout_width="match_parent"
+            android:layout_height="wrap_content"
+            android:layout_marginTop="16dp"
+            android:text="Scan the code with a phone that is signed in to DMS. Confirm the branch on the phone. Choose the video in DMS after that."
+            android:textColor="#161513"
+            android:textSize="22sp" />
 
         <TextView
             android:id="@+id/status"
             android:layout_width="match_parent"
             android:layout_height="wrap_content"
-            android:layout_marginTop="8dp"
-            android:text="Listening for the Pi…"
-            android:textColor="#6F6A63" />
-
-        <EditText
-            android:id="@+id/serverUrl"
-            android:layout_width="match_parent"
-            android:layout_height="wrap_content"
             android:layout_marginTop="16dp"
-            android:hint="http://192.168.x.x:8080 (optional if beacon found)"
-            android:inputType="textUri" />
+            android:text=""
+            android:textColor="#6F6A63"
+            android:textSize="18sp" />
+    </LinearLayout>
 
-        <EditText
-            android:id="@+id/pairingCode"
-            android:layout_width="match_parent"
-            android:layout_height="wrap_content"
-            android:layout_marginTop="8dp"
-            android:hint="Pairing code"
-            android:inputType="textCapCharacters"
-            android:maxLength="8" />
+    <LinearLayout
+        android:layout_width="0dp"
+        android:layout_height="match_parent"
+        android:layout_weight="1"
+        android:gravity="center"
+        android:orientation="vertical">
 
-        <EditText
-            android:id="@+id/deviceName"
-            android:layout_width="match_parent"
-            android:layout_height="wrap_content"
-            android:layout_marginTop="8dp"
-            android:hint="Device name"
-            android:inputType="textCapWords" />
+        <ImageView
+            android:id="@+id/claimQr"
+            android:layout_width="280dp"
+            android:layout_height="280dp"
+            android:contentDescription="Claim code"
+            android:visibility="gone" />
 
-        <Button
-            android:id="@+id/pair"
+        <TextView
+            android:id="@+id/claimCode"
             android:layout_width="wrap_content"
             android:layout_height="wrap_content"
-            android:layout_marginTop="16dp"
-            android:text="Pair" />
+            android:layout_marginTop="12dp"
+            android:letterSpacing="0.2"
+            android:textColor="#161513"
+            android:textSize="36sp"
+            android:textStyle="bold" />
     </LinearLayout>
-</ScrollView>
+</LinearLayout>

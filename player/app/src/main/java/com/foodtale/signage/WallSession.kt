@@ -25,6 +25,7 @@ class WallSession(
 
     @Volatile var manifest: Manifest? = null
         private set
+    @Volatile var showingGap: Boolean = false
     @Volatile var lastDeltaMs: Long = 0
         private set
 
@@ -72,13 +73,13 @@ class WallSession(
     }
 
     fun applyManifest(m: Manifest) {
+        val prev = manifest
+        manifest = m
+        if (m.items.isNotEmpty()) Prefs.manifestJson(m.toJson().toString())
         onMain {
-            val prev = manifest
-            manifest = m
             Prefs.deviceId(m.deviceId)
             if (m.cmsId.isNotBlank()) Prefs.cmsId(m.cmsId)
             engine.mute(!m.isLeader)
-            if (m.items.isNotEmpty()) Prefs.manifestJson(m.toJson().toString())
             if (prev == null || prev.syncGeneration != m.syncGeneration || prev.playlistId != m.playlistId) {
                 index = 0
                 holdingLateJoin = false
@@ -118,6 +119,7 @@ class WallSession(
     }
 
     fun onEnded() {
+        if (engine.showingStill || engine.showingHold || showingGap) return
         onMain {
             val pos = engine.snapshotPositionMs
             val item = manifest?.items?.getOrNull(index)
@@ -301,13 +303,21 @@ class WallSession(
         val run = object : Runnable {
             override fun run() {
                 if (holdingLateJoin || !playArmed) return
-                val file = fileFor(index)
-                if (file == null || !engine.start(file)) {
+                val started = when {
+                    isGap(index) -> engine.showGap()
+                    isHold(index) -> engine.holdLastFrame() || engine.showGap()
+                    else -> {
+                        val file = fileFor(index)
+                        file != null && engine.start(file, isStill(index), isLoop(index))
+                    }
+                }
+                if (!started) {
                     playRun = this
                     main.postDelayed(this, 40)
                     paintHud("preload")
                     return
                 }
+                showingGap = isGap(index) || (isHold(index) && engine.showingGap)
                 val late = clock.syncedNow() - playAtEpoch
                 playArmed = false
                 holdingLateJoin = false
@@ -318,6 +328,7 @@ class WallSession(
                 lateThisPlay = late.coerceAtLeast(0L)
                 cancelPulse()
                 if (late > MISS_SLACK_MS) lastDrop = "late ${late}ms"
+                paintHud()
             }
         }
         playRun = run
@@ -450,8 +461,13 @@ class WallSession(
     private fun prepareCurrent() {
         val m = manifest ?: return
         val item = m.items.getOrNull(index) ?: return
+        if (isHold(index) || isGap(index)) {
+            preparedId = item.id
+            return
+        }
         val file = fileFor(index) ?: return
-        if (engine.snapshotPlaying) engine.preload(file) else engine.prepare(file)
+        val still = isStill(index)
+        if (engine.snapshotPlaying) engine.preload(file, still) else engine.prepare(file, still)
         preparedId = item.id
     }
 
@@ -462,8 +478,23 @@ class WallSession(
             clock.lastOkAt == 0L || m.startMasterMs <= 0 -> (index + 1) % m.items.size
             else -> liveIndex(m, nextCutEpoch(m, clock.syncedNow()))
         }
+        if (isHold(idx) || isGap(idx)) return
         val file = fileFor(idx) ?: return
-        engine.preload(file)
+        engine.preload(file, isStill(idx))
+    }
+
+    private fun isStill(idx: Int): Boolean =
+        manifest?.items?.getOrNull(idx)?.type == "image"
+
+    private fun isHold(idx: Int): Boolean =
+        manifest?.items?.getOrNull(idx)?.type == "hold"
+
+    private fun isGap(idx: Int): Boolean =
+        manifest?.items?.getOrNull(idx)?.type == "gap"
+
+    private fun isLoop(idx: Int): Boolean {
+        val item = manifest?.items?.getOrNull(idx) ?: return false
+        return item.type == "video" && item.fileDurationMs in 1 until item.durationMs
     }
 
     private fun fileFor(idx: Int): File? {
@@ -473,11 +504,14 @@ class WallSession(
     }
 
     private fun nudgeDrift() {
+        if (engine.showingStill || engine.showingHold || showingGap) return
+        val itemNow = manifest?.items?.getOrNull(index)
+        if (itemNow != null && itemNow.type != "video") return
         val m = manifest ?: return
         if (m.startMasterMs <= 0L) return
         val now = clock.syncedNow()
         if (now < m.startMasterMs) return
-        val timeline = now - anchorSlot(m, now)
+        val timeline = playbackTimeline(now)
         val driftNow = engine.snapshotPositionMs - timeline
         if (!openingSampled &&
             engine.snapshotPositionMs >= 80L &&
@@ -531,6 +565,7 @@ class WallSession(
     }
 
     private fun unstickTail() {
+        if (engine.showingStill || engine.showingHold || showingGap || isLoop(index)) return
         val m = manifest ?: return
         if (m.startMasterMs <= 0L) return
         val now = clock.syncedNow()
@@ -558,7 +593,15 @@ class WallSession(
         if (m.startMasterMs <= 0L) return 0L
         val now = clock.syncedNow()
         if (now < m.startMasterMs) return 0L
-        return engine.snapshotPositionMs - (now - anchorSlot(m, now))
+        return engine.snapshotPositionMs - playbackTimeline(now)
+    }
+
+    private fun playbackTimeline(now: Long): Long {
+        val elapsed = now - anchorSlot(manifest ?: return 0L, now)
+        val item = manifest?.items?.getOrNull(index) ?: return elapsed
+        val file = item.fileDurationMs.toLong()
+        if (item.type == "video" && file in 1 until item.durationMs) return elapsed.mod(file)
+        return elapsed
     }
 
     private fun prepareUpcoming() {
@@ -590,7 +633,11 @@ class WallSession(
         engine.mute(!m.isLeader)
         prepareCurrent()
         val file = fileFor(idx)
-        val lead = if (file != null && engine.canStart(file)) learnedLead else 0L
+        val lead = when {
+            isHold(idx) || isGap(idx) -> 0L
+            file != null && engine.canStart(file, isStill(idx)) -> learnedLead
+            else -> 0L
+        }
         leadThisPlay = lead
         armedBase = base
         schedulePlayAt(base - lead)

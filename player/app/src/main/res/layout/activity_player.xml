@@ -23,15 +23,74 @@
         app:surface_type="surface_view"
         app:use_controller="false" />
 
-    <TextView
-        android:id="@+id/hud"
+    <ImageView
+        android:id="@+id/stillView"
+        android:layout_width="match_parent"
+        android:layout_height="match_parent"
+        android:contentDescription="@null"
+        android:scaleType="centerCrop"
+        android:visibility="gone" />
+
+    <LinearLayout
+        android:id="@+id/emptyMedia"
+        android:layout_width="match_parent"
+        android:layout_height="match_parent"
+        android:gravity="center"
+        android:orientation="vertical"
+        android:padding="48dp"
+        android:visibility="gone">
+
+        <TextView
+            android:layout_width="wrap_content"
+            android:layout_height="wrap_content"
+            android:text="No media"
+            android:textColor="#FFFFFF"
+            android:textSize="48sp"
+            android:textStyle="bold" />
+
+        <TextView
+            android:layout_width="wrap_content"
+            android:layout_height="wrap_content"
+            android:layout_marginTop="20dp"
+            android:gravity="center"
+            android:text="In DMS, assign a published playlist to this device.\nThis screen starts playing on its own."
+            android:textColor="#D0D0D0"
+            android:textSize="24sp" />
+    </LinearLayout>
+
+    <View
+        android:id="@+id/pointerCatcher"
+        android:layout_width="match_parent"
+        android:layout_height="match_parent"
+        android:background="@android:color/transparent"
+        android:clickable="false"
+        android:focusable="false" />
+
+    <LinearLayout
+        android:id="@+id/playerChrome"
         android:layout_width="wrap_content"
         android:layout_height="wrap_content"
         android:layout_gravity="top|start"
         android:layout_margin="12dp"
-        android:background="#99000000"
-        android:fontFamily="monospace"
-        android:padding="8dp"
-        android:textColor="#CCFF90"
-        android:textSize="12sp" />
+        android:orientation="vertical"
+        android:visibility="gone">
+
+        <TextView
+            android:id="@+id/hud"
+            android:layout_width="wrap_content"
+            android:layout_height="wrap_content"
+            android:background="#99000000"
+            android:fontFamily="monospace"
+            android:padding="8dp"
+            android:textColor="#CCFF90"
+            android:textSize="12sp" />
+
+        <Button
+            android:id="@+id/systemSettings"
+            android:layout_width="wrap_content"
+            android:layout_height="wrap_content"
+            android:layout_marginTop="8dp"
+            android:text="System settings"
+            android:textAllCaps="false" />
+    </LinearLayout>
 </FrameLayout>

@@ -8,6 +8,8 @@ import org.json.JSONObject
 import java.io.File
 import java.util.concurrent.TimeUnit
 
+class PairingRevoked : Exception("pairing revoked")
+
 class CmsApi {
     private val http = OkHttpClient.Builder()
         .connectTimeout(5, TimeUnit.SECONDS)
@@ -19,6 +21,79 @@ class CmsApi {
         http.newCall(req).execute().use { resp ->
             val body = resp.body?.string().orEmpty()
             if (!resp.isSuccessful) error("health ${resp.code}")
+            return JSONObject(body)
+        }
+    }
+
+    fun claimHead(base: String): JSONObject = getJson("${base.trimEnd('/')}/api/claim/head")
+
+    fun claimShow(base: String, code: String): JSONObject =
+        getJson("${base.trimEnd('/')}/api/claims/${code.trim().uppercase()}")
+
+    fun claimRole(base: String, code: String): JSONObject {
+        val req = Request.Builder()
+            .url("${base.trimEnd('/')}/api/claims/${code.trim().uppercase()}/role")
+            .get()
+            .build()
+        http.newCall(req).execute().use { resp ->
+            val body = resp.body?.string().orEmpty()
+            if (resp.code == 404) throw PairingRevoked()
+            if (!resp.isSuccessful) error(body.ifBlank { "role ${resp.code}" })
+            return JSONObject(body)
+        }
+    }
+
+    fun registerClaim(base: String, code: String, cmsId: String) {
+        val payload = JSONObject()
+            .put("code", code)
+            .put("role", "head")
+            .put("cms_id", cmsId)
+            .put("local_device_id", 1)
+            .toString()
+        val req = Request.Builder()
+            .url("${base.trimEnd('/')}/api/claims")
+            .post(payload.toRequestBody("application/json".toMediaType()))
+            .build()
+        http.newCall(req).execute().use { resp ->
+            val body = resp.body?.string().orEmpty()
+            if (!resp.isSuccessful) error(body.ifBlank { "claim ${resp.code}" })
+        }
+    }
+
+    fun adoptClaim(base: String, code: String): JSONObject = postCode("${base.trimEnd('/')}/api/claim/adopt", code)
+
+    fun joinClaim(base: String, code: String): JSONObject = postCode("${base.trimEnd('/')}/api/claim/join", code)
+
+    private fun postCode(url: String, code: String): JSONObject {
+        val payload = JSONObject().put("code", code.trim().uppercase()).toString()
+        val req = Request.Builder()
+            .url(url)
+            .post(payload.toRequestBody("application/json".toMediaType()))
+            .build()
+        return readJson(req, "claim")
+    }
+
+    fun claimScreen(base: String, name: String, token: String): JSONObject {
+        val payload = JSONObject()
+            .put("device_name", name)
+            .put("device_token", token)
+            .toString()
+        val req = Request.Builder()
+            .url("${base.trimEnd('/')}/api/claim/screen")
+            .post(payload.toRequestBody("application/json".toMediaType()))
+            .build()
+        return readJson(req, "claim")
+    }
+
+    private fun getJson(url: String): JSONObject {
+        val req = Request.Builder().url(url).get().build()
+        return readJson(req, "claim")
+    }
+
+    private fun readJson(req: Request, label: String): JSONObject {
+        http.newCall(req).execute().use { resp ->
+            val body = resp.body?.string().orEmpty()
+            if (!resp.isSuccessful) error(body.ifBlank { "$label ${resp.code}" })
             return JSONObject(body)
         }
     }
@@ -56,6 +131,7 @@ class CmsApi {
         http.newCall(reqBuilder.build()).execute().use { resp ->
             if (resp.code == 304) return null
             val body = resp.body?.string().orEmpty()
+            if (resp.code == 401) throw PairingRevoked()
             if (!resp.isSuccessful) error(body.ifBlank { "manifest ${resp.code}" })
             resp.header("ETag")?.let { Prefs.etag(it) }
             return Manifest.fromJson(JSONObject(body))

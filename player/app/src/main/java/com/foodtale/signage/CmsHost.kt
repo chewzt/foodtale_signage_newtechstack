@@ -1,34 +1,65 @@
 package com.foodtale.signage
 
 import android.content.Context
+import android.net.ConnectivityManager
 import android.util.Log
 import java.io.File
+import java.net.Inet4Address
 import java.net.InetSocketAddress
 import java.net.Socket
 
 /**
- * Starts the Go CMS. Only the cms build calls this.
- * A second start on this device does nothing while 8080 is already open.
+ * Starts the Go CMS only while this device is the branch head.
+ * A second start does nothing while 8080 is already open.
  */
 object CmsHost {
     private const val TAG = "CmsHost"
+    private val gate = Any()
+    @Volatile private var want = false
+    private var child: Process? = null
+    private var thread: Thread? = null
+    private var app: Context? = null
 
     fun start(context: Context) {
-        val app = context.applicationContext
-        Thread {
-            var child: Process? = null
-            while (true) {
-                try {
-                    val running = child?.isAlive == true
-                    if (!running && !portOpen()) {
-                        child = launch(app)
+        synchronized(gate) {
+            app = context.applicationContext
+            want = true
+            if (thread?.isAlive == true) return
+            thread = Thread {
+                while (true) {
+                    val ctx = app ?: break
+                    try {
+                        if (!want) {
+                            stopChild()
+                        } else if (child?.isAlive != true && !portOpen()) {
+                            child = launch(ctx)
+                        }
+                    } catch (e: Exception) {
+                        Log.e(TAG, "cms start failed", e)
                     }
-                } catch (e: Exception) {
-                    Log.e(TAG, "cms start failed", e)
+                    Thread.sleep(1_000)
                 }
-                Thread.sleep(5_000)
-            }
-        }.start()
+            }.also { it.isDaemon = true; it.start() }
+        }
+    }
+
+    fun stop() {
+        want = false
+        stopChild()
+    }
+
+    fun wanted(): Boolean = want
+
+    fun ready(): Boolean = want && portOpen()
+
+    fun dmsPublicUrl(): String =
+        readEnvFile(File("/data/local/tmp/foodtale/cms.env"))["DMS_PUBLIC_URL"]?.trim()?.trimEnd('/') ?: ""
+
+    private fun stopChild() {
+        val proc = child
+        child = null
+        proc?.destroy()
+        if (proc?.isAlive == true) proc.destroyForcibly()
     }
 
     private fun launch(context: Context): Process? {
@@ -40,6 +71,8 @@ object CmsHost {
         }
         val dir = File(context.filesDir, "cms")
         dir.mkdirs()
+        val preset = Prefs.installationId()
+        if (preset.isNotBlank()) writeIdIfMissing(dir, preset)
         File(dir, "media").mkdirs()
         File(dir, "public").mkdirs()
         adoptShellData(dir)
@@ -51,6 +84,8 @@ object CmsHost {
         val saved = readEnvFile(File("/data/local/tmp/foodtale/cms.env"))
         saved["CMS_ID"]?.let { writeIdIfMissing(dir, it) }
         saved["ADMIN_PASSWORD"]?.let { env["ADMIN_PASSWORD"] = it }
+        saved["DMS_PUBLIC_URL"]?.let { env["DMS_PUBLIC_URL"] = it }
+        advertiseHttp(context)?.let { env["HTTP_ADVERTISE"] = it }
         readId(dir)?.let { env["CMS_ID"] = it }
         val pb = ProcessBuilder(lib.absolutePath)
         pb.environment().putAll(env)
@@ -59,6 +94,16 @@ object CmsHost {
         val child = pb.start()
         Log.i(TAG, "cms started data=${dir.absolutePath}")
         return child
+    }
+
+    private fun advertiseHttp(context: Context): String? {
+        val cm = context.getSystemService(ConnectivityManager::class.java) ?: return null
+        val props = cm.getLinkProperties(cm.activeNetwork ?: return null) ?: return null
+        val ip = props.linkAddresses.firstOrNull { link ->
+            val addr = link.address
+            addr is Inet4Address && !addr.isLoopbackAddress && !addr.isLinkLocalAddress
+        }?.address?.hostAddress ?: return null
+        return "http://$ip:8080"
     }
 
     private fun portOpen(): Boolean {
