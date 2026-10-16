@@ -12,40 +12,49 @@ class BeaconListener(
 ) {
     @Volatile private var running = false
     private var thread: Thread? = null
+    private var socket: DatagramSocket? = null
 
     fun start() {
-        if (running) return
+        if (thread?.isAlive == true) return
         running = true
         thread = Thread {
-            DatagramSocket(null).use { sock ->
-                sock.reuseAddress = true
-                sock.bind(InetSocketAddress(port))
-                sock.soTimeout = 1500
-                val buf = ByteArray(2048)
-                while (running) {
-                    try {
-                        val pkt = DatagramPacket(buf, buf.size)
-                        sock.receive(pkt)
-                        val json = JSONObject(String(pkt.data, 0, pkt.length, StandardCharsets.UTF_8))
-                        if (json.optString("service") != "foodtale-cms") continue
-                        onBeacon(
-                            Beacon(
-                                v = json.optInt("v", 1),
-                                service = json.optString("service"),
-                                cmsId = json.optString("cmsId"),
-                                http = json.optString("http").trimEnd('/'),
-                                clockPort = json.optInt("clockPort", 8123),
+            try {
+                DatagramSocket(null).use { sock ->
+                    socket = sock
+                    sock.reuseAddress = true
+                    sock.bind(InetSocketAddress(port))
+                    sock.soTimeout = 1500
+                    val buf = ByteArray(2048)
+                    while (running) {
+                        try {
+                            val pkt = DatagramPacket(buf, buf.size)
+                            sock.receive(pkt)
+                            val json = JSONObject(String(pkt.data, 0, pkt.length, StandardCharsets.UTF_8))
+                            if (json.optString("service") != "foodtale-cms") continue
+                            onBeacon(
+                                Beacon(
+                                    v = json.optInt("v", 1),
+                                    service = json.optString("service"),
+                                    cmsId = json.optString("cmsId"),
+                                    http = json.optString("http").trimEnd('/'),
+                                    clockPort = json.optInt("clockPort", 8123),
+                                )
                             )
-                        )
-                    } catch (_: Exception) {
+                        } catch (_: Exception) {
+                        }
                     }
                 }
+            } catch (_: Exception) {
+            } finally {
+                socket = null
+                running = false
             }
         }.also { it.isDaemon = true; it.start() }
     }
 
     fun stop() {
         running = false
+        socket?.close()
         thread?.interrupt()
     }
 }

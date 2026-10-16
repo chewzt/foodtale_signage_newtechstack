@@ -3,6 +3,7 @@ package httpapi
 import (
 	"crypto/sha256"
 	"encoding/hex"
+	"encoding/json"
 	"io"
 	"log"
 	"os"
@@ -27,6 +28,10 @@ func (s *Server) submitReport() {
 		return
 	}
 	rows := make([]dms.ReportDevice, 0, len(claims))
+	acks := make([]struct {
+		deviceID int64
+		eventIDs []string
+	}, 0, len(claims))
 	for _, claim := range claims {
 		if !claim.Claimed {
 			continue
@@ -41,17 +46,74 @@ func (s *Server) submitReport() {
 		if dev.PlayItemID != nil {
 			item, _ = s.st.ItemFilename(*dev.PlayItemID)
 		}
+		tel, _ := s.st.Telemetry(dev.ID)
+		pending, _ := s.st.TakeEvents(dev.ID, 50)
+		events := make([]dms.ReportEvent, 0, len(pending))
+		ids := make([]string, 0, len(pending))
+		for _, event := range pending {
+			var meta map[string]any
+			if event.Meta != "" {
+				_ = json.Unmarshal([]byte(event.Meta), &meta)
+			}
+			events = append(events, dms.ReportEvent{
+				ID:       event.ID,
+				At:       event.OccurredAt,
+				Type:     event.Type,
+				Severity: event.Severity,
+				Message:  event.Message,
+				Meta:     meta,
+			})
+			ids = append(ids, event.ID)
+		}
 		rows = append(rows, dms.ReportDevice{
-			Code:        claim.Code,
-			Playing:     playing,
-			Item:        item,
-			SeenSeconds: seen,
+			Code:          claim.Code,
+			Playing:       playing,
+			Item:          item,
+			SeenSeconds:   seen,
+			Speed:         tel.Speed,
+			DriftMs:       tel.DriftMs,
+			ClockOffsetMs: dev.ClockOffsetMs,
+			ClockRttMs:    dev.ClockRTTMs,
+			LeadMs:        tel.LeadMs,
+			Phase:         tel.Phase,
+			AppVersion:    tel.AppVersion,
+			PlayedMs:      tel.PlayedMs,
+			DriftAbsSum:   tel.DriftAbsSum,
+			DriftSamples:  tel.DriftSamples,
+			SpeedNudges:   tel.SpeedNudges,
+			UptimeMs:      tel.UptimeMs,
+			Events:        events,
 		})
+		acks = append(acks, struct {
+			deviceID int64
+			eventIDs []string
+		}{dev.ID, ids})
 	}
 	client := dms.New(s.cfg.DMSPublicURL)
-	results, err := client.Report(head.Code, rows)
+	results, brand, err := client.Report(head.Code, rows)
 	if err != nil {
+		if strings.Contains(err.Error(), "dms 422") {
+			s.branchHead.Store(false)
+		}
 		log.Printf("dms report: %v", err)
+		return
+	}
+	for _, ack := range acks {
+		_ = s.st.AckReport(ack.deviceID, ack.eventIDs)
+	}
+	s.applyBrand(client, head.Code, brand)
+	demoted := false
+	for _, result := range results {
+		if result.Code == head.Code && !result.IsHead {
+			demoted = true
+			s.branchHead.Store(false)
+			if result.HeadDeviceID != 0 {
+				s.branchHeadID.Store(result.HeadDeviceID)
+				s.branchHeadName.Store(result.HeadDeviceName)
+			}
+		}
+	}
+	if demoted {
 		return
 	}
 	byCode := map[string]dms.ReportResult{}
@@ -117,35 +179,36 @@ func (s *Server) applyPlayback(client *dms.Client, claim *store.DmsClaim, playba
 	if err != nil {
 		return err
 	}
-	if !playback.Assigned || playback.PlaylistID == 0 || len(playableItems(rowSource(playback))) == 0 {
+	if playback.Schedule != nil && playback.Schedule.ID != 0 {
+		raw, err := json.Marshal(playback.Schedule)
+		if err != nil {
+			return err
+		}
+		if err := s.st.SaveDeviceSchedule(dev.ID, playback.ScreenRow, string(raw)); err != nil {
+			return err
+		}
+		for _, nested := range playback.Schedule.Playlists {
+			if _, err := s.prepareLocal(client, claim.Code, nested); err != nil {
+				return err
+			}
+		}
+		if err := s.st.SaveDmsChoice(dev.ID, 0, ""); err != nil {
+			return err
+		}
+		return s.activateSchedule(dev, *playback.Schedule, playback.ScreenRow)
+	}
+	if err := s.st.ClearDeviceSchedule(dev.ID); err != nil {
+		return err
+	}
+	localID, err := s.prepareLocal(client, claim.Code, playback)
+	if err != nil {
+		return err
+	}
+	if localID == 0 {
 		if dev.PlaylistID != nil {
 			return s.st.Unassign(dev.ID)
 		}
 		return nil
-	}
-	wall := wallSource(playback)
-	generation, localID, ok, err := s.st.DmsLocalPlaylist(playback.PlaylistID, 0)
-	if err != nil {
-		return err
-	}
-	covers, err := s.st.DmsMediaCovers(playback.PlaylistID, mediaIDs(playableItems(wall)))
-	if err != nil {
-		return err
-	}
-	if ok && localID != 0 {
-		if pl, err := s.st.Playlist(localID); err == nil && pl.PanelCount < panelCount(wall) {
-			covers = false
-		}
-	}
-	if !ok || generation != playback.Generation || !covers {
-		localID, err = s.materializePlayback(client, claim.Code, playback, 0, localID)
-		if err != nil {
-			return err
-		}
-		log.Printf("dms playback device=%d playlist=%d generation=%d", dev.ID, playback.PlaylistID, playback.Generation)
-	}
-	if err := s.st.SetPanelCount(localID, panelCount(wall)); err != nil {
-		return err
 	}
 	if err := s.st.SaveDmsChoice(dev.ID, 0, ""); err != nil {
 		return err
@@ -154,6 +217,76 @@ func (s *Server) applyPlayback(client *dms.Client, claim *store.DmsClaim, playba
 		return nil
 	}
 	return s.st.Assign(dev.ID, localID, playback.ScreenRow)
+}
+
+func (s *Server) prepareLocal(client *dms.Client, code string, playback dms.Playback) (int64, error) {
+	if !playback.Assigned || playback.PlaylistID == 0 || len(playableItems(rowSource(playback))) == 0 {
+		return 0, nil
+	}
+	wall := wallSource(playback)
+	generation, localID, ok, err := s.st.DmsLocalPlaylist(playback.PlaylistID, 0)
+	if err != nil {
+		return 0, err
+	}
+	covers, err := s.st.DmsMediaCovers(playback.PlaylistID, mediaIDs(playableItems(wall)))
+	if err != nil {
+		return 0, err
+	}
+	if ok && localID != 0 {
+		if pl, err := s.st.Playlist(localID); err == nil && pl.PanelCount < panelCount(wall) {
+			covers = false
+		}
+	}
+	if !ok || generation != playback.Generation || !covers {
+		localID, err = s.materializePlayback(client, code, playback, 0, localID)
+		if err != nil {
+			return 0, err
+		}
+		log.Printf("dms playback playlist=%d generation=%d", playback.PlaylistID, playback.Generation)
+	}
+	if err := s.st.SetPanelCount(localID, panelCount(wall)); err != nil {
+		return 0, err
+	}
+	return localID, nil
+}
+
+func (s *Server) activateSchedule(dev *store.Device, plan dms.Schedule, screenRow int) error {
+	active := dms.ActivePlaylistID(plan, time.Now())
+	if active == 0 {
+		return nil
+	}
+	_, localID, ok, err := s.st.DmsLocalPlaylist(active, 0)
+	if err != nil || !ok || localID == 0 {
+		return err
+	}
+	if dev.PlaylistID != nil && *dev.PlaylistID == localID && dev.PanelIndex == screenRow {
+		return nil
+	}
+	if err := RestartSync(s.st, localID); err != nil {
+		return err
+	}
+	return s.st.Assign(dev.ID, localID, screenRow)
+}
+
+func (s *Server) followStoredSchedules() {
+	rows, err := s.st.DeviceSchedules()
+	if err != nil {
+		log.Printf("schedule: %v", err)
+		return
+	}
+	for _, row := range rows {
+		var plan dms.Schedule
+		if err := json.Unmarshal([]byte(row.Body), &plan); err != nil {
+			continue
+		}
+		dev, err := s.st.DeviceByID(row.DeviceID)
+		if err != nil || dev == nil {
+			continue
+		}
+		if err := s.activateSchedule(dev, plan, row.ScreenRow); err != nil {
+			log.Printf("schedule device=%d: %v", row.DeviceID, err)
+		}
+	}
 }
 
 func mediaIDs(items []dms.PlaybackItem) []int64 {

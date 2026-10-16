@@ -1,5 +1,8 @@
 package com.foodtale.signage
 
+import android.content.res.ColorStateList
+import android.graphics.BitmapFactory
+import android.graphics.Color
 import android.content.Intent
 import android.content.pm.ActivityInfo
 import android.net.ConnectivityManager
@@ -16,9 +19,11 @@ import android.view.MotionEvent
 import android.view.View
 import android.view.WindowManager
 import android.widget.ImageView
+import android.widget.ProgressBar
 import android.widget.TextView
 import android.widget.Toast
 import org.json.JSONObject
+import java.io.File
 import java.util.concurrent.ConcurrentHashMap
 import kotlin.random.Random
 import androidx.appcompat.app.AppCompatActivity
@@ -30,6 +35,7 @@ import androidx.media3.ui.PlayerView
 
 class MainActivity : AppCompatActivity() {
     private val main = Handler(Looper.getMainLooper())
+    private var splashDone = false
     private val api = CmsApi()
     private lateinit var clock: ClockClient
     private var bus: PlayBus? = null
@@ -45,6 +51,7 @@ class MainActivity : AppCompatActivity() {
     private val seenBeacons = ConcurrentHashMap<String, Long>()
     @Volatile private var claimToken = ""
     @Volatile private var claimBusy = false
+    private var lastClaimRenew = 0L
     private var claimRunning = false
     private val hideChrome = Runnable {
         findViewById<View>(R.id.playerChrome)?.visibility = View.GONE
@@ -52,7 +59,7 @@ class MainActivity : AppCompatActivity() {
     private var shownClaimUrl = ""
     private val pollClaim = object : Runnable {
         override fun run() {
-            if (!claimRunning || Prefs.paired()) return
+            if (!claimRunning || Prefs.paired() || roleKnown) return
             if (!claimBusy) {
                 claimBusy = true
                 Thread {
@@ -74,15 +81,23 @@ class MainActivity : AppCompatActivity() {
         }
     }
     @Volatile private var roleBusy = false
+    @Volatile private var roleKnown = false
+    @Volatile private var roleAsked = false
+    @Volatile private var knownHead = false
+    @Volatile private var knownHeadId = 0L
+    @Volatile private var knownHeadName = ""
     private val pollRole = object : Runnable {
         override fun run() {
-            if (!BuildConfig.START_CMS || Prefs.paired()) return
-            if (!roleBusy) {
+            if (!BuildConfig.START_CMS) return
+            val retry = roleKnown && !roleMatches()
+            if ((!roleKnown || retry) && !roleBusy) {
                 roleBusy = true
                 Thread {
                     try {
                         applyRole()
                     } catch (_: PairingRevoked) {
+                        roleKnown = false
+                        roleAsked = false
                         main.post {
                             CmsHost.stop()
                             Prefs.claimCode("")
@@ -237,6 +252,13 @@ class MainActivity : AppCompatActivity() {
     }
 
     private fun showClaim() {
+        running = false
+        session?.release()
+        session = null
+        engine?.release()
+        engine = null
+        bus?.stop()
+        bus = null
         setContentView(R.layout.activity_pair)
         claimRunning = true
         claimToken = ""
@@ -264,11 +286,53 @@ class MainActivity : AppCompatActivity() {
         val show = api.claimShow(dms, code)
         if (show.optBoolean("revoked")) throw PairingRevoked()
         if (show.optBoolean("claimed")) return JSONObject().put("ready", true).put("waiting_role", true)
+        // The code only stays valid while this screen is showing it. Renew
+        // before the 10 minute window ends, and immediately if it already died.
+        val now = System.currentTimeMillis()
+        if (show.optBoolean("expired") || now - lastClaimRenew > 60_000) {
+            api.registerClaim(dms, code, Prefs.installationId())
+            lastClaimRenew = now
+        }
         return JSONObject().put("ready", true).put("code", code).put("url", "$dms/claim/$code")
+    }
+
+    private fun roleMatches(): Boolean {
+        if (!roleKnown) return false
+        return if (knownHead) headSettled() else followerSettled()
+    }
+
+    private fun headSettled(): Boolean {
+        return Prefs.paired() && Prefs.deviceName() == "Head" && CmsHost.wanted()
+    }
+
+    private fun followerSettled(): Boolean {
+        return Prefs.paired() &&
+            Prefs.deviceName() != "Head" &&
+            !CmsHost.wanted() &&
+            !Prefs.http().contains("127.0.0.1")
     }
 
     private fun applyRole() {
         if (!BuildConfig.START_CMS) return
+        if (!roleKnown && headSettled()) {
+            roleKnown = true
+            knownHead = true
+            return
+        }
+        if (!roleKnown && followerSettled()) {
+            roleKnown = true
+            knownHead = false
+            return
+        }
+        if (roleMatches()) return
+        if (roleKnown && !knownHead && (knownHeadId != 0L || roleAsked)) {
+            becomeFollower(Prefs.claimCode(), knownHeadId, knownHeadName)
+            return
+        }
+        if (roleKnown && knownHead) {
+            becomeHead(Prefs.claimCode())
+            return
+        }
         val dms = CmsHost.dmsPublicUrl()
         if (dms.isBlank()) return
         var code = Prefs.claimCode()
@@ -295,16 +359,17 @@ class MainActivity : AppCompatActivity() {
         if (show.optBoolean("revoked")) throw PairingRevoked()
         if (!show.optBoolean("claimed")) return
         val role = api.claimRole(dms, code)
-        val headId = role.optLong("head_device_id")
-        if (role.optBoolean("is_head")) {
-            val already = CmsHost.ready() && Prefs.paired() && Prefs.headDeviceId() == headId
-            Prefs.headDeviceId(headId)
-            if (!already) becomeHead(code)
+        roleAsked = true
+        roleKnown = true
+        knownHead = role.optBoolean("is_head")
+        knownHeadId = role.optLong("head_device_id")
+        knownHeadName = role.optString("head_device_name")
+        Prefs.headDeviceId(knownHeadId)
+        if (knownHead) {
+            becomeHead(code)
             return
         }
-        val already = !CmsHost.wanted() && Prefs.paired() && Prefs.followedHeadId() == headId &&
-            headId != 0L && !Prefs.http().contains("127.0.0.1")
-        if (!already) becomeFollower(code, headId, role.optString("head_device_name"))
+        becomeFollower(code, knownHeadId, knownHeadName)
     }
 
     private fun becomeHead(code: String) {
@@ -323,13 +388,14 @@ class MainActivity : AppCompatActivity() {
     }
 
     private fun becomeFollower(code: String, headId: Long, headName: String) {
-        if (CmsHost.wanted() || Prefs.http().contains("127.0.0.1")) {
+        if (CmsHost.wanted() || Prefs.deviceName() == "Head" || Prefs.http().contains("127.0.0.1")) {
             CmsHost.stop()
             Prefs.token("")
             Prefs.cmsId("")
             Prefs.etag("")
             Prefs.manifestJson("")
             Prefs.http("")
+            Prefs.deviceName("Screen")
             Prefs.followedHeadId(0)
         }
         if (headId == 0L) {
@@ -343,10 +409,12 @@ class MainActivity : AppCompatActivity() {
         if (!claimRunning) {
             main.post { showClaim() }
         }
-        val candidates = seenBeacons.entries
+        val remembered = Prefs.http().trimEnd('/')
+        val candidates = (seenBeacons.entries
             .filter { System.currentTimeMillis() - it.value < 15_000 }
-            .map { it.key }
+            .map { it.key } + remembered)
             .filter { it.isNotBlank() && !it.contains("127.0.0.1") }
+            .distinct()
         if (candidates.isEmpty()) {
             main.post {
                 hideClaimCode()
@@ -406,7 +474,10 @@ class MainActivity : AppCompatActivity() {
     private fun renderClaim(result: JSONObject) {
         if (result.optBoolean("waiting_role")) {
             hideClaimCode()
-            setClaimStatus("Claimed. Checking whether this screen is the branch host.")
+            val current = findViewById<TextView>(R.id.status)?.text?.toString().orEmpty()
+            if (!current.startsWith("Looking for") && current != "This branch has no host yet.") {
+                setClaimStatus("Claimed. Checking whether this screen is the branch host.")
+            }
             return
         }
         if (result.optString("reason") == "registering") {
@@ -485,19 +556,21 @@ class MainActivity : AppCompatActivity() {
         Prefs.manifestJson("")
         Prefs.followedHeadId(0)
         running = false
+        session?.release()
+        session = null
         engine?.release()
         engine = null
         bus?.stop()
         bus = null
-        session = null
-        if (!claimRunning) showClaim()
+        showClaim()
     }
 
     private fun showPlayer() {
+        stopClaim()
         beacon?.stop()
         setContentView(R.layout.activity_player)
         main.removeCallbacks(hideChrome)
-        findViewById<View>(R.id.playerChrome)?.visibility = View.GONE
+        findViewById<View>(R.id.playerChrome)?.visibility = View.VISIBLE
         findViewById<View>(R.id.pointerCatcher).setOnHoverListener { _, event ->
             if (event.actionMasked == MotionEvent.ACTION_HOVER_MOVE ||
                 event.actionMasked == MotionEvent.ACTION_HOVER_ENTER
@@ -535,9 +608,12 @@ class MainActivity : AppCompatActivity() {
             this,
             onEnded = { session?.onEnded() },
             onReady = { session?.onReady() },
+            onEvent = { type, severity, message -> session?.noteEvent(type, severity, message) },
         )
         engine = eng
         eng.attach(view, preload, still)
+        eng.watchPicture { updateSplash() }
+        session?.release()
         bus?.stop()
         val playBus = PlayBus(this) { msg -> main.post { session?.onPlayMsg(msg) } }
         playBus.start()
@@ -549,11 +625,16 @@ class MainActivity : AppCompatActivity() {
                 hud.text = listOf(line, updateHint).filter { it.isNotBlank() }.joinToString("\n")
                 val hasMedia = session?.manifest?.items?.isNotEmpty() == true && session?.showingGap != true
                 emptyMedia.visibility = if (hasMedia) View.GONE else View.VISIBLE
+                updateSplash()
             }
         }
         clock.restore()
         api.parseCached(Prefs.manifestJson())?.let { session?.applyManifest(it) }
+        updateSplash()
         beacon = BeaconListener { b ->
+            // Same CMS only: its beacon may refresh this box's saved URL when the
+            // LAN address changes. Which branch this screen belongs to is decided
+            // by DMS at join, not by comparing CMS ids.
             if (Prefs.cmsId().isNotBlank() && b.cmsId != Prefs.cmsId()) return@BeaconListener
             if (!httpOk || Prefs.http() != b.http) {
                 Prefs.http(b.http)
@@ -561,6 +642,103 @@ class MainActivity : AppCompatActivity() {
             }
         }.also { it.start() }
         startLoops()
+    }
+
+    private fun updateSplash() {
+        val splash = findViewById<View>(R.id.splash) ?: return
+        val playing = engine?.snapshotPlaying == true && engine?.pictureOnScreen() == true
+        val knownEmpty = session?.manifest != null && session?.manifest?.items?.isEmpty() == true
+        if (playing || knownEmpty) splashDone = true
+        val show = !splashDone
+        splash.visibility = if (show) View.VISIBLE else View.GONE
+        if (!show) return
+        paintBrand()
+        val bar = findViewById<ProgressBar>(R.id.splashBar) ?: return
+        val time = findViewById<TextView>(R.id.splashTime)
+        val total = session?.playlistMs ?: 0L
+        val loaded = (session?.loadedMs ?: 0L).coerceIn(0L, if (total > 0) total else 0L)
+        val downloading = total > 0L && loaded < total
+        if (!downloading) {
+            if (!bar.isIndeterminate) bar.isIndeterminate = true
+            time?.text = ""
+            return
+        }
+        if (bar.isIndeterminate) bar.isIndeterminate = false
+        bar.max = 1000
+        bar.progress = ((loaded * 1000) / total).toInt()
+        time?.text = "${clockText(loaded)} / ${clockText(total)}"
+    }
+
+    private fun rememberBrand(man: Manifest) {
+        if (man.brandBranch.isNotBlank()) Prefs.brandBranch(man.brandBranch)
+        if (man.brandColor.isNotBlank()) Prefs.brandColor(man.brandColor)
+        val logo = man.brandLogo
+        val dest = File(filesDir, "brand-logo")
+        if (logo.isBlank()) {
+            if (dest.exists()) dest.delete()
+            Prefs.brandLogo("")
+            main.post { updateSplash() }
+            return
+        }
+        if (Prefs.brandLogo() != logo || !dest.exists()) {
+            val base = Prefs.http().trimEnd('/')
+            val url = if (logo.startsWith("http")) logo else "$base$logo"
+            try {
+                api.download(url, dest)
+                Prefs.brandLogo(logo)
+            } catch (_: Exception) {
+            }
+        }
+        main.post { updateSplash() }
+    }
+
+    private fun paintBrand() {
+        val splash = findViewById<View>(R.id.splash) ?: return
+        val color = brandColor(Prefs.brandColor())
+        splash.setBackgroundColor(color)
+        val ink = if (isDark(color)) Color.WHITE else Color.parseColor("#161513")
+        findViewById<TextView>(R.id.splashBranch)?.let {
+            it.text = Prefs.brandBranch()
+            it.setTextColor(ink)
+        }
+        findViewById<TextView>(R.id.splashTime)?.setTextColor(ink)
+        findViewById<ProgressBar>(R.id.splashBar)?.let { bar ->
+            bar.progressTintList = ColorStateList.valueOf(ink)
+            bar.progressBackgroundTintList = ColorStateList.valueOf(ink and 0x55FFFFFF)
+        }
+        val logo = findViewById<ImageView>(R.id.splashLogo) ?: return
+        val file = File(filesDir, "brand-logo")
+        if (!file.exists()) {
+            logo.setImageDrawable(null)
+            logo.visibility = View.GONE
+            return
+        }
+        val stamp = file.lastModified()
+        if (logo.tag == stamp) return
+        val bitmap = BitmapFactory.decodeFile(file.absolutePath) ?: return
+        logo.setImageBitmap(bitmap)
+        logo.tag = stamp
+        logo.visibility = View.VISIBLE
+    }
+
+    private fun brandColor(raw: String): Int {
+        val text = raw.trim()
+        if (text.matches(Regex("#[0-9A-Fa-f]{6}"))) {
+            return Color.parseColor(text)
+        }
+        return Color.parseColor("#2C3E50")
+    }
+
+    private fun isDark(color: Int): Boolean {
+        val r = Color.red(color)
+        val g = Color.green(color)
+        val b = Color.blue(color)
+        return (r * 299 + g * 587 + b * 114) / 1000 < 160
+    }
+
+    private fun clockText(ms: Long): String {
+        val seconds = ms / 1000
+        return "%d:%02d".format(seconds / 60, seconds % 60)
     }
 
     private fun startLoops() {
@@ -602,7 +780,16 @@ class MainActivity : AppCompatActivity() {
                             if (man != null && man.cmsId.isNotBlank() && man.cmsId != Prefs.cmsId()) {
                                 httpOk = false
                             } else {
-                                if (man != null) session?.applyManifest(man)
+                                if (man != null && !man.branchIsHead && Prefs.deviceName() == "Head" && CmsHost.wanted()) {
+                                    knownHead = false
+                                    if (man.branchHeadId != 0L) knownHeadId = man.branchHeadId
+                                    if (man.branchHeadName.isNotBlank()) knownHeadName = man.branchHeadName
+                                    roleKnown = true
+                                }
+                                if (man != null) {
+                                    rememberBrand(man)
+                                    session?.applyManifest(man)
+                                }
                                 session?.ensureDownloads()
                             }
                         } catch (_: PairingRevoked) {
@@ -645,7 +832,6 @@ class MainActivity : AppCompatActivity() {
         val chrome = findViewById<View>(R.id.playerChrome) ?: return
         chrome.visibility = View.VISIBLE
         main.removeCallbacks(hideChrome)
-        main.postDelayed(hideChrome, 5_000)
     }
 
     override fun dispatchGenericMotionEvent(ev: MotionEvent): Boolean {
@@ -671,6 +857,7 @@ class MainActivity : AppCompatActivity() {
         main.removeCallbacks(openWifiSettings)
         stopListeningForLan()
         worker?.interrupt()
+        session?.release()
         beacon?.stop()
         bus?.stop()
         engine?.release()

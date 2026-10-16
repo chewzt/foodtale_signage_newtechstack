@@ -327,6 +327,15 @@ func (s *Server) watchRevokes() {
 	}
 }
 
+func (s *Server) watchSchedules() {
+	tick := time.NewTicker(15 * time.Second)
+	defer tick.Stop()
+	for {
+		<-tick.C
+		s.followStoredSchedules()
+	}
+}
+
 func (s *Server) pollRevokes() {
 	if strings.TrimSpace(s.cfg.DMSPublicURL) == "" {
 		return

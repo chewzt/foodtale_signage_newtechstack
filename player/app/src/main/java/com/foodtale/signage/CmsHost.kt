@@ -52,8 +52,11 @@ object CmsHost {
 
     fun ready(): Boolean = want && portOpen()
 
-    fun dmsPublicUrl(): String =
-        readEnvFile(File("/data/local/tmp/foodtale/cms.env"))["DMS_PUBLIC_URL"]?.trim()?.trimEnd('/') ?: ""
+    fun dmsPublicUrl(): String {
+        val baked = BuildConfig.DMS_PUBLIC_URL.trim().trimEnd('/')
+        if (baked.isNotEmpty()) return baked
+        return readEnvFile(File("/data/local/tmp/foodtale/cms.env"))["DMS_PUBLIC_URL"]?.trim()?.trimEnd('/') ?: ""
+    }
 
     private fun stopChild() {
         val proc = child
@@ -84,8 +87,16 @@ object CmsHost {
         val saved = readEnvFile(File("/data/local/tmp/foodtale/cms.env"))
         saved["CMS_ID"]?.let { writeIdIfMissing(dir, it) }
         saved["ADMIN_PASSWORD"]?.let { env["ADMIN_PASSWORD"] = it }
-        saved["DMS_PUBLIC_URL"]?.let { env["DMS_PUBLIC_URL"] = it }
+        val baked = BuildConfig.DMS_PUBLIC_URL.trim().trimEnd('/')
+        if (baked.isNotEmpty()) {
+            env["DMS_PUBLIC_URL"] = baked
+        } else {
+            saved["DMS_PUBLIC_URL"]?.let { env["DMS_PUBLIC_URL"] = it }
+        }
         advertiseHttp(context)?.let { env["HTTP_ADVERTISE"] = it }
+        val dns = dnsServers(context).ifBlank { "1.1.1.1,8.8.8.8" }
+        env["RESOLV_NAMESERVERS"] = dns
+        Log.i(TAG, "dns $dns")
         readId(dir)?.let { env["CMS_ID"] = it }
         val pb = ProcessBuilder(lib.absolutePath)
         pb.environment().putAll(env)
@@ -122,13 +133,26 @@ object CmsHost {
         val src = File("/data/local/tmp/foodtale")
         val db = File(src, "cms.db")
         if (!db.canRead()) return
-        db.copyTo(File(dir, "cms.db"), overwrite = false)
-        val id = File(src, "cms.id")
-        if (id.canRead()) id.copyTo(File(dir, "cms.id"), overwrite = false)
+        copyIfAbsent(db, File(dir, "cms.db"))
+        copyIfAbsent(File(src, "cms.id"), File(dir, "cms.id"))
         val media = File(src, "media")
         media.listFiles()?.forEach { f ->
-            if (f.isFile && f.canRead()) f.copyTo(File(dir, "media/${f.name}"), overwrite = false)
+            if (f.isFile && f.canRead()) copyIfAbsent(f, File(dir, "media/${f.name}"))
         }
+    }
+
+    private fun copyIfAbsent(src: File, dest: File) {
+        if (!src.isFile || !src.canRead() || dest.exists()) return
+        dest.parentFile?.mkdirs()
+        src.copyTo(dest, overwrite = false)
+    }
+
+    private fun dnsServers(context: Context): String {
+        val cm = context.getSystemService(ConnectivityManager::class.java) ?: return ""
+        val props = cm.getLinkProperties(cm.activeNetwork ?: return "") ?: return ""
+        return props.dnsServers.mapNotNull { addr ->
+            addr.hostAddress?.substringBefore('%')?.takeIf { it.isNotBlank() }
+        }.distinct().joinToString(",")
     }
 
     private fun readId(dir: File): String? {

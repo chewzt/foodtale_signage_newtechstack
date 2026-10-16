@@ -38,6 +38,12 @@ data class Manifest(
     val syncGeneration: Long,
     val items: List<MediaItem>,
     val leaderIdHint: Long = 0,
+    val branchIsHead: Boolean = true,
+    val branchHeadId: Long = 0,
+    val branchHeadName: String = "",
+    val brandBranch: String = "",
+    val brandColor: String = "",
+    val brandLogo: String = "",
 ) {
     val group: String get() = "p$playlistId|$syncGeneration"
     val leaderId: Long
@@ -84,6 +90,9 @@ data class Manifest(
             .put("start_at", startAt)
             .put("start_master_ms", startMasterMs)
             .put("sync_generation", syncGeneration)
+            .put("brand_branch", brandBranch)
+            .put("brand_color", brandColor)
+            .put("brand_logo", brandLogo)
             .put("items", itemArr)
     }
 
@@ -130,6 +139,12 @@ data class Manifest(
                 syncGeneration = j.optLong("sync_generation"),
                 items = itemList,
                 leaderIdHint = j.optLong("leader_id"),
+                branchIsHead = if (j.has("branch_is_head")) j.getBoolean("branch_is_head") else true,
+                branchHeadId = j.optLong("branch_head_id"),
+                branchHeadName = j.optString("branch_head_name"),
+                brandBranch = j.optString("brand_branch"),
+                brandColor = j.optString("brand_color"),
+                brandLogo = j.optString("brand_logo"),
             )
         }
     }

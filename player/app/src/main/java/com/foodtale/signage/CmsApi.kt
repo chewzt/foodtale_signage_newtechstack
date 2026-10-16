@@ -147,13 +147,15 @@ class CmsApi {
         }
     }
 
-    fun heartbeat(base: String, token: String, payload: JSONObject) {
+    fun heartbeat(base: String, token: String, payload: JSONObject): Boolean {
         val req = Request.Builder()
             .url("${base.trimEnd('/')}/api/device/heartbeat")
             .header("Authorization", "Bearer $token")
             .post(payload.toString().toRequestBody("application/json".toMediaType()))
             .build()
-        http.newCall(req).execute().use { }
+        http.newCall(req).execute().use { resp ->
+            return resp.isSuccessful
+        }
     }
 
     fun appVersion(base: String): JSONObject {
@@ -165,15 +167,27 @@ class CmsApi {
         }
     }
 
-    fun download(url: String, dest: File) {
+    fun download(url: String, dest: File, onProgress: (read: Long, total: Long) -> Unit = { _, _ -> }) {
         dest.parentFile?.mkdirs()
         val tmp = File(dest.absolutePath + ".part")
         val req = Request.Builder().url(url).get().build()
         http.newCall(req).execute().use { resp ->
             if (!resp.isSuccessful) error("download ${resp.code}")
-            resp.body?.byteStream()?.use { input ->
-                tmp.outputStream().use { output -> input.copyTo(output) }
-            } ?: error("empty body")
+            val body = resp.body ?: error("empty body")
+            val length = body.contentLength()
+            body.byteStream().use { input ->
+                tmp.outputStream().use { output ->
+                    val buf = ByteArray(64 * 1024)
+                    var read = 0L
+                    while (true) {
+                        val n = input.read(buf)
+                        if (n < 0) break
+                        output.write(buf, 0, n)
+                        read += n
+                        if (length > 0) onProgress(read, length)
+                    }
+                }
+            }
         }
         if (!tmp.renameTo(dest)) {
             tmp.copyTo(dest, overwrite = true)

@@ -4,14 +4,17 @@ import android.os.Handler
 import android.os.Looper
 import org.json.JSONObject
 import java.io.File
-import java.util.ArrayDeque
 
 /**
  * The visible decoder keeps running through a cut. The other decoder
  * prerolls the next item. At the cut we swap. A late swap still plays.
- * Each device presses play earlier by its own recent opening lag, and only
- * when the parked decoder is already ready. Drift of 50–800ms is a 3%
- * nudge toward the timeline. Past 800ms, one seek per cut.
+ * Each device presses play earlier by its own learned lead, and only
+ * when the parked decoder is already ready. A cold device, or a miss
+ * bigger than 80ms, moves the next start by half the gap, at most 96ms,
+ * so it is close in about three clips. After that it moves at most 8ms.
+ * The value is stored on that device.
+ * The first 1.5s of a clip stays at speed 1. After that, drift of
+ * 50–800ms is a 3% nudge. Past 800ms, one seek per cut.
  */
 class WallSession(
     private val engine: PlayerEngine,
@@ -26,6 +29,14 @@ class WallSession(
     @Volatile var manifest: Manifest? = null
         private set
     @Volatile var showingGap: Boolean = false
+    @Volatile var loadedMs: Long = 0
+        private set
+    @Volatile var playlistMs: Long = 0
+        private set
+    @Volatile private var partialSha = ""
+    @Volatile private var partialRead = 0L
+    @Volatile private var partialLen = 0L
+    private var lastProgressUi = 0L
     @Volatile var lastDeltaMs: Long = 0
         private set
 
@@ -45,6 +56,7 @@ class WallSession(
     private var handlingEnded = false
     private var lastPresenceAt = 0L
     private val seenPeers = LinkedHashMap<Long, Long>()
+    @Volatile private var closed = false
     private var axisRun: Runnable? = null
     private var lastSlotEpoch: Long = -1
     private var cutBusy = false
@@ -52,24 +64,29 @@ class WallSession(
     private var soughtThisPlay = false
     private var appliedSpeed = 1f
     private var stallResumes = 0
-    private var learnedLead = 0L
+    private var learnedLead = Prefs.playbackLead().coerceIn(0L, LEAD_CAP_MS)
     private var leadThisPlay = 0L
     private var lateThisPlay = 0L
     private var openingSampled = false
     private var armedBase = 0L
-    private val leadSamples = ArrayDeque<Long>()
+    private var shownDrift = 0L
     @Volatile private var reportQuery: String = ""
+    private val telemetry = Telemetry()
 
     val playing: Boolean get() = engine.snapshotPlaying
     val settling: Boolean get() = playArmed && !engine.snapshotPlaying
 
     private companion object {
         const val CUT_PAD_MS = 180L
-        const val SETTLE_MS = 350L
         const val MISS_SLACK_MS = 40L
         const val NUDGE_MS = 50L
         const val SEEK_MS = 800L
         const val LEAD_CAP_MS = 400L
+        const val LEAD_STEP_MS = 8L
+        const val LEAD_FAST_GAP_MS = 80L
+        const val LEAD_FAST_CAP_MS = 96L
+        const val OPENING_HOLD_MS = 1500L
+        const val SETTLE_UNTIL_MS = 3500L
     }
 
     fun applyManifest(m: Manifest) {
@@ -80,6 +97,9 @@ class WallSession(
             Prefs.deviceId(m.deviceId)
             if (m.cmsId.isNotBlank()) Prefs.cmsId(m.cmsId)
             engine.mute(!m.isLeader)
+            if (prev != null && prev.syncGeneration != m.syncGeneration) {
+                telemetry.event("generation_changed", "info", "playlist generation ${m.syncGeneration}")
+            }
             if (prev == null || prev.syncGeneration != m.syncGeneration || prev.playlistId != m.playlistId) {
                 index = 0
                 holdingLateJoin = false
@@ -93,6 +113,7 @@ class WallSession(
                 prepareCurrent()
                 armAxis()
             }
+            noteLoad()
             paintHud()
         }
     }
@@ -147,9 +168,24 @@ class WallSession(
         }
     }
 
+    fun release() {
+        closed = true
+        onMain {
+            axisRun?.let { main.removeCallbacks(it) }
+            axisRun = null
+            cancelPulse()
+            cancelPlay()
+            playArmed = false
+        }
+    }
+
     fun tickPlayBus() {
         onMain {
+            if (closed) return@onMain
             engine.capture()
+            shownDrift = driftMs()
+            telemetry.played(engine.snapshotPlaying && engine.pictureOnScreen())
+            telemetry.clock(clock.lastOkAt == 0L || kotlin.math.abs(clock.offsetMs) > 5_000L, clock.offsetMs)
             announcePresence()
             tryPendingStarts()
             val m = manifest ?: run {
@@ -161,16 +197,25 @@ class WallSession(
                 startBurstLeft = 0
             }
             if (engine.snapshotPlaying) {
+                engine.recoverBlankSurface()
                 preloadNext()
                 nudgeDrift()
             } else {
                 unstickTail()
             }
-            if (!m.isLeader && lastLeaderAt > 0 && clock.syncedNow() - lastLeaderAt > 2000) {
+            // A cut shout is sent only when a clip starts. Two seconds of silence
+            // during the clip is normal. Re-arming with slot=now while the picture
+            // is already moving resets the drift anchor and restarts the file.
+            if (!engine.snapshotPlaying &&
+                !m.isLeader &&
+                lastLeaderAt > 0 &&
+                clock.syncedNow() - lastLeaderAt > 2000
+            ) {
                 val now = clock.syncedNow()
                 if (Prefs.deviceId() == nextLeader(m) && now - lastFailoverAt > 2000) {
                     lastFailoverAt = now
-                    enterBarrier(index, now, now + SETTLE_MS + 400)
+                    telemetry.event("failover", "warn", "took over as leader")
+                    enterBarrier(liveIndex(m, now), slotEpoch(m, now))
                 }
             }
             paintHud()
@@ -183,7 +228,8 @@ class WallSession(
         lastCmsBeat = now
         val m = manifest ?: return
         try {
-            api.heartbeat(
+            val snap = telemetry.snapshot()
+            val ok = api.heartbeat(
                 Prefs.http(),
                 Prefs.token(),
                 JSONObject()
@@ -193,8 +239,21 @@ class WallSession(
                     .put("item_id", m.items.getOrNull(index)?.id ?: 0)
                     .put("lag_ms", lastDeltaMs)
                     .put("playing", engine.snapshotPlaying)
+                    .put("speed", telemetry.speed.toDouble())
+                    .put("drift_ms", telemetry.driftMs)
+                    .put("lead_ms", telemetry.leadMs)
+                    .put("phase", telemetry.phase)
+                    .put("app_version", telemetry.version)
+                    .put("played_ms", snap.optLong("played_ms"))
+                    .put("played_token", snap.optString("played_token"))
+                    .put("drift_abs_sum", snap.optLong("drift_abs_sum"))
+                    .put("drift_samples", snap.optInt("drift_samples"))
+                    .put("speed_nudges", snap.optInt("speed_nudges"))
+                    .put("uptime_ms", SignageApp.uptimeMs())
+                    .put("events", snap.optJSONArray("events"))
                     .put("status", reportQuery),
             )
+            if (ok) telemetry.ack()
         } catch (_: Exception) {
         }
     }
@@ -202,12 +261,49 @@ class WallSession(
     fun ensureDownloads() {
         val m = manifest ?: return
         for (item in m.items) {
-            if (item.sha256.isBlank()) continue
-            if (!cache.has(item.sha256)) {
-                api.download(item.url, cache.fileFor(item.sha256))
+            if (item.sha256.isBlank() || cache.has(item.sha256)) continue
+            partialSha = item.sha256
+            partialRead = 0
+            partialLen = 0
+            noteLoad()
+            try {
+                api.download(item.url, cache.fileFor(item.sha256)) { read, length ->
+                    partialRead = read
+                    partialLen = length
+                    val now = System.currentTimeMillis()
+                    if (now - lastProgressUi < 200) return@download
+                    lastProgressUi = now
+                    onMain {
+                        noteLoad()
+                        paintHud()
+                    }
+                }
+            } catch (_: Exception) {
+            }
+            partialSha = ""
+            partialRead = 0
+            partialLen = 0
+        }
+        noteLoad()
+        onMain {
+            if (preparedId < 0) prepareCurrent()
+            paintHud()
+        }
+    }
+
+    private fun noteLoad() {
+        val m = manifest ?: return
+        val total = totalDur(m).toLong()
+        var ready = 0L
+        for (item in m.items) {
+            val dur = itemDur(item).toLong()
+            when {
+                item.sha256.isBlank() || cache.has(item.sha256) -> ready += dur
+                item.sha256 == partialSha && partialLen > 0 -> ready += dur * partialRead / partialLen
             }
         }
-        onMain { if (preparedId < 0) prepareCurrent() }
+        loadedMs = ready.coerceAtMost(total)
+        playlistMs = total
     }
 
     fun refreshHud() {
@@ -251,6 +347,7 @@ class WallSession(
     }
 
     private fun announcePresence() {
+        if (closed) return
         val id = Prefs.deviceId()
         if (id == 0L) return
         val now = clock.syncedNow()
@@ -399,28 +496,35 @@ class WallSession(
 
     private fun armAxis() {
         axisRun?.let { main.removeCallbacks(it) }
+        axisRun = null
+        if (closed) return
         val m = manifest ?: return
         if (m.items.isEmpty() || clock.lastOkAt == 0L || m.startMasterMs <= 0) return
         val now = clock.syncedNow()
         val live = timelineWait(m, now)
         if (live > 0) {
-            val run = Runnable { onAxisCut() }
-            axisRun = run
-            main.postDelayed(run, live)
+            postAxis(live) { onAxisCut() }
             return
         }
         val boundary = nextCutEpoch(m, now)
         val wakeAt = boundary - learnedLead
         val wait = wakeAt - now
-        val run = Runnable { onAxisCut() }
-        axisRun = run
         when {
-            wait <= 0 -> main.post(run)
-            wait > 32 -> main.postDelayed({ armAxis() }, (wait - 12).coerceAtLeast(1))
-            else -> main.postDelayed({
-                if (clock.syncedNow() >= wakeAt) onAxisCut() else armAxis()
-            }, 4)
+            wait <= 0 -> postAxis(0) { onAxisCut() }
+            wait > 32 -> postAxis((wait - 12).coerceAtLeast(1)) { armAxis() }
+            else -> postAxis(4) {
+                if (!closed && clock.syncedNow() >= wakeAt) onAxisCut() else if (!closed) armAxis()
+            }
         }
+    }
+
+    private fun postAxis(delayMs: Long, block: () -> Unit) {
+        val run = Runnable {
+            if (closed) return@Runnable
+            block()
+        }
+        axisRun = run
+        if (delayMs <= 0L) main.post(run) else main.postDelayed(run, delayMs)
     }
 
     private fun timelineWait(m: Manifest, now: Long): Long {
@@ -429,7 +533,7 @@ class WallSession(
     }
 
     private fun onAxisCut() {
-        if (cutBusy) return
+        if (closed || cutBusy) return
         cutBusy = true
         try {
             val m = manifest ?: return
@@ -446,7 +550,7 @@ class WallSession(
             enterBarrier(idx, slot)
         } finally {
             cutBusy = false
-            armAxis()
+            if (!closed) armAxis()
         }
     }
 
@@ -513,16 +617,23 @@ class WallSession(
         if (now < m.startMasterMs) return
         val timeline = playbackTimeline(now)
         val driftNow = engine.snapshotPositionMs - timeline
+        val pos = engine.snapshotPositionMs
         if (!openingSampled &&
-            engine.snapshotPositionMs >= 80L &&
             appliedSpeed == 1f &&
-            timeline in -400L..1500L &&
-            kotlin.math.abs(driftNow) <= 2000L &&
+            timeline in OPENING_HOLD_MS..SETTLE_UNTIL_MS &&
+            pos >= 0L &&
+            kotlin.math.abs(driftNow) <= SEEK_MS &&
             lateThisPlay <= 120L
         ) {
             noteOpening(driftNow)
         }
-        if (timeline < 400L) return
+        if (timeline < OPENING_HOLD_MS) {
+            if (appliedSpeed != 1f) {
+                engine.setSpeed(1f)
+                appliedSpeed = 1f
+            }
+            return
+        }
         val item = manifest?.items?.getOrNull(index) ?: return
         val dur = itemDur(item).toLong()
         val expected = timeline.coerceAtLeast(0L)
@@ -554,13 +665,19 @@ class WallSession(
     private fun noteOpening(drift: Long) {
         if (openingSampled) return
         openingSampled = true
-        val next = (leadThisPlay - drift).coerceIn(0L, LEAD_CAP_MS)
-        leadSamples.addLast(next)
-        while (leadSamples.size > 5) leadSamples.removeFirst()
-        val sorted = leadSamples.sorted()
-        val updated = sorted[sorted.size / 2]
-        if (updated == learnedLead) return
-        learnedLead = updated
+        if (kotlin.math.abs(drift) > SEEK_MS) return
+        val target = (leadThisPlay - drift).coerceIn(0L, LEAD_CAP_MS)
+        val gap = target - learnedLead
+        val cold = learnedLead < 40L && kotlin.math.abs(gap) > LEAD_STEP_MS
+        val step = if (kotlin.math.abs(gap) > LEAD_FAST_GAP_MS || cold) {
+            (gap / 2).coerceIn(-LEAD_FAST_CAP_MS, LEAD_FAST_CAP_MS)
+        } else {
+            gap.coerceIn(-LEAD_STEP_MS, LEAD_STEP_MS)
+        }
+        val next = (learnedLead + step).coerceIn(0L, LEAD_CAP_MS)
+        if (next == learnedLead) return
+        learnedLead = next
+        Prefs.playbackLead(next)
         armAxis()
     }
 
@@ -652,6 +769,7 @@ class WallSession(
         var n = 0
         val run = object : Runnable {
             override fun run() {
+                if (closed) return
                 val m = manifest ?: return
                 if (!m.isLeader || !playArmed || engine.snapshotPlaying || n >= 10) return
                 lastStart?.let { bus.send(it.copy(sendTime = clock.syncedNow()), peerIps(m)) }
@@ -670,6 +788,7 @@ class WallSession(
     }
 
     private fun emitStart(item: MediaItem, target: Long) {
+        if (closed) return
         val m = manifest ?: return
         val msg = PlayMsg(
             v = 1,
@@ -712,14 +831,33 @@ class WallSession(
                 append("ms")
             }
             append(" spd=").append("%.2f".format(engine.currentSpeed()))
-            append(" drift=").append(driftMs()).append("ms")
+            append(" drift=").append(shownDrift).append("ms")
             append(" lead=").append(learnedLead)
             if (lastDrop.isNotBlank()) append(" ").append(lastDrop)
             if (extra.isNotBlank()) append(" ").append(extra)
             append("\n").append(Prefs.http())
         }
+        telemetry.speed = engine.currentSpeed()
+        telemetry.driftMs = shownDrift
+        telemetry.leadMs = learnedLead
+        telemetry.phase = phaseLabel()
+        telemetry.version = BuildConfig.VERSION_NAME
+        telemetry.noteSpeed(engine.currentSpeed())
+        if (engine.snapshotPlaying) telemetry.sampleDrift(shownDrift)
+        telemetry.drop(lastDrop)
         publishReport()
         hud(line)
+    }
+
+    fun noteEvent(type: String, severity: String, message: String) {
+        telemetry.event(type, severity, message)
+    }
+
+    private fun phaseLabel(): String = when {
+        holdingLateJoin -> "HOLD"
+        settling -> "SETTLE"
+        engine.snapshotPlaying -> "PLAY"
+        else -> "IDLE"
     }
 
     fun statusQuery(): String = reportQuery

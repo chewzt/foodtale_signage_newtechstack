@@ -11,8 +11,8 @@ android {
         applicationId = "com.foodtale.signage"
         minSdk = 24
         targetSdk = 35
-        versionCode = 34
-        versionName = "0.2.33"
+        versionCode = 55
+        versionName = "0.2.54"
     }
 
     flavorDimensions += "role"
@@ -20,10 +20,29 @@ android {
         create("player") {
             dimension = "role"
             buildConfigField("boolean", "START_CMS", "false")
+            buildConfigField("String", "DMS_PUBLIC_URL", "\"\"")
         }
         create("cms") {
             dimension = "role"
             buildConfigField("boolean", "START_CMS", "true")
+            buildConfigField("String", "DMS_PUBLIC_URL", "\"\"")
+        }
+        create("cmsSit") {
+            dimension = "role"
+            applicationIdSuffix = ".sit"
+            versionNameSuffix = "-sit"
+            buildConfigField("boolean", "START_CMS", "true")
+            buildConfigField(
+                "String",
+                "DMS_PUBLIC_URL",
+                "\"https://display-management-system.nextale-sit.com\""
+            )
+            resValue("string", "app_name", "Signage SIT")
+        }
+    }
+    sourceSets {
+        getByName("cmsSit") {
+            jniLibs.srcDir("src/cms/jniLibs")
         }
     }
 
@@ -80,7 +99,9 @@ val buildCms = tasks.register<Exec>("buildCms") {
     inputs.file(cmsDir.file("main.go"))
 }
 tasks.configureEach {
-    if (name == "preCmsDebugBuild" || name == "preCmsReleaseBuild") {
+    if (name == "preCmsDebugBuild" || name == "preCmsReleaseBuild" ||
+        name == "preCmsSitDebugBuild" || name == "preCmsSitReleaseBuild"
+    ) {
         dependsOn(buildCms)
     }
 }

@@ -11,6 +11,7 @@ import (
 	"os"
 	"strconv"
 	"strings"
+	"sync/atomic"
 	"time"
 
 	"github.com/go-chi/chi/v5"
@@ -22,13 +23,22 @@ import (
 )
 
 type Server struct {
-	cfg *config.Config
-	st  *store.Store
-	tpl *templateEngine
+	cfg            *config.Config
+	st             *store.Store
+	tpl            *templateEngine
+	branchHead     atomic.Bool
+	branchHeadID   atomic.Int64
+	branchHeadName atomic.Value
+	brandBranch    atomic.Value
+	brandColor     atomic.Value
+	brandLogoVer   atomic.Value
 }
 
 func Listen(cfg *config.Config, st *store.Store) error {
 	s := &Server{cfg: cfg, st: st, tpl: newTemplate()}
+	s.branchHead.Store(true)
+	s.branchHeadName.Store("")
+	s.loadBrand()
 	r := chi.NewRouter()
 	r.Use(middleware.RequestID)
 	r.Use(middleware.RealIP)
@@ -47,6 +57,7 @@ func Listen(cfg *config.Config, st *store.Store) error {
 	r.Post("/api/device/heartbeat", s.heartbeat)
 
 	r.Get("/media/{sha}", s.media)
+	r.Get("/brand/logo", s.brandLogo)
 	r.Get("/foodtale-player.apk", s.apk)
 	r.Get("/foodtale-player.json", s.appVersion)
 
@@ -71,6 +82,7 @@ func Listen(cfg *config.Config, st *store.Store) error {
 	})
 
 	go s.watchRevokes()
+	go s.watchSchedules()
 
 	srv := &http.Server{
 		Addr:              cfg.HTTPAddr(),
@@ -198,21 +210,28 @@ func (s *Server) manifest(w http.ResponseWriter, r *http.Request) {
 
 func (s *Server) manifestBody(d *store.Device) map[string]any {
 	base := s.cfg.AdvertiseURL()
+	brandBranch, brandColor, brandLogo := s.brandTriple()
 	if d.PlaylistID == nil {
 		return map[string]any{
-			"playlist_name":   "Unassigned",
-			"playlist_id":     0,
-			"device_id":       d.ID,
-			"cms_id":          s.cfg.CMSID,
-			"kind":            "playlist",
-			"panel_count":     1,
-			"panel_index":     0,
-			"peer_count":      1,
-			"peers":           []store.Peer{{ID: d.ID, Name: d.Name}},
-			"start_at":        time.Now().UTC().Format(time.RFC3339Nano),
-			"start_master_ms": 0,
-			"sync_generation": 0,
-			"items":           []any{},
+			"playlist_name":    "Unassigned",
+			"brand_branch":     brandBranch,
+			"brand_color":      brandColor,
+			"brand_logo":       brandLogo,
+			"playlist_id":      0,
+			"device_id":        d.ID,
+			"cms_id":           s.cfg.CMSID,
+			"kind":             "playlist",
+			"panel_count":      1,
+			"panel_index":      0,
+			"peer_count":       1,
+			"peers":            []store.Peer{{ID: d.ID, Name: d.Name}},
+			"branch_is_head":   s.branchHead.Load(),
+			"branch_head_id":   s.branchHeadID.Load(),
+			"branch_head_name": s.headName(),
+			"start_at":         time.Now().UTC().Format(time.RFC3339Nano),
+			"start_master_ms":  0,
+			"sync_generation":  0,
+			"items":            []any{},
 		}
 	}
 	pl, err := s.st.Playlist(*d.PlaylistID)
@@ -267,20 +286,26 @@ func (s *Server) manifestBody(d *store.Device) map[string]any {
 		leaderID = head.LocalDeviceID
 	}
 	return map[string]any{
-		"playlist_name":   pl.Name,
-		"playlist_id":     pl.ID,
-		"device_id":       d.ID,
-		"cms_id":          s.cfg.CMSID,
-		"kind":            pl.Kind,
-		"panel_count":     panelCount,
-		"panel_index":     panelIndex,
-		"peer_count":      len(peers),
-		"peers":           peers,
-		"leader_id":       leaderID,
-		"start_at":        pl.StartAt,
-		"start_master_ms": pl.StartMasterMs,
-		"sync_generation": pl.SyncGeneration,
-		"items":           mapped,
+		"playlist_name":    pl.Name,
+		"playlist_id":      pl.ID,
+		"device_id":        d.ID,
+		"cms_id":           s.cfg.CMSID,
+		"kind":             pl.Kind,
+		"panel_count":      panelCount,
+		"panel_index":      panelIndex,
+		"peer_count":       len(peers),
+		"peers":            peers,
+		"leader_id":        leaderID,
+		"branch_is_head":   s.branchHead.Load(),
+		"branch_head_id":   s.branchHeadID.Load(),
+		"branch_head_name": s.headName(),
+		"brand_branch":     brandBranch,
+		"brand_color":      brandColor,
+		"brand_logo":       brandLogo,
+		"start_at":         pl.StartAt,
+		"start_master_ms":  pl.StartMasterMs,
+		"sync_generation":  pl.SyncGeneration,
+		"items":            mapped,
 	}
 }
 
@@ -300,15 +325,70 @@ func (s *Server) heartbeat(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	var body struct {
-		ClockOffsetMs *int   `json:"clock_offset_ms"`
-		ClockRTTMs    *int   `json:"clock_rtt_ms"`
-		Index         *int   `json:"index"`
-		ItemID        *int64 `json:"item_id"`
-		LagMs         *int   `json:"lag_ms"`
-		Playing       *bool  `json:"playing"`
+		ClockOffsetMs *int     `json:"clock_offset_ms"`
+		ClockRTTMs    *int     `json:"clock_rtt_ms"`
+		Index         *int     `json:"index"`
+		ItemID        *int64   `json:"item_id"`
+		LagMs         *int     `json:"lag_ms"`
+		Playing       *bool    `json:"playing"`
+		Speed         *float64 `json:"speed"`
+		DriftMs       *int     `json:"drift_ms"`
+		LeadMs        *int     `json:"lead_ms"`
+		Phase         string   `json:"phase"`
+		AppVersion    string   `json:"app_version"`
+		PlayedMs      int64    `json:"played_ms"`
+		PlayedToken   string   `json:"played_token"`
+		DriftAbsSum   int64    `json:"drift_abs_sum"`
+		DriftSamples  int      `json:"drift_samples"`
+		SpeedNudges   int      `json:"speed_nudges"`
+		UptimeMs      int64    `json:"uptime_ms"`
+		Events        []struct {
+			ID       string         `json:"id"`
+			At       any            `json:"at"`
+			Type     string         `json:"type"`
+			Severity string         `json:"severity"`
+			Message  string         `json:"message"`
+			Meta     map[string]any `json:"meta"`
+		} `json:"events"`
 	}
 	_ = json.NewDecoder(io.LimitReader(r.Body, 1<<20)).Decode(&body)
 	_ = s.st.Touch(d.ID, body.ClockOffsetMs, body.ClockRTTMs, body.Index, body.ItemID, body.LagMs, body.Playing, remoteIP(r))
+	_ = s.st.SaveTelemetry(d.ID, store.Telemetry{
+		Speed:        body.Speed,
+		DriftMs:      body.DriftMs,
+		LeadMs:       body.LeadMs,
+		Phase:        body.Phase,
+		AppVersion:   body.AppVersion,
+		DriftAbsSum:  body.DriftAbsSum,
+		DriftSamples: body.DriftSamples,
+		SpeedNudges:  body.SpeedNudges,
+		UptimeMs:     body.UptimeMs,
+	}, body.PlayedMs, body.PlayedToken)
+	pending := make([]store.PendingEvent, 0, len(body.Events))
+	for _, event := range body.Events {
+		meta := ""
+		if event.Meta != nil {
+			raw, _ := json.Marshal(event.Meta)
+			meta = string(raw)
+		}
+		at := ""
+		switch v := event.At.(type) {
+		case string:
+			at = v
+		case float64:
+			at = time.UnixMilli(int64(v)).UTC().Format(time.RFC3339Nano)
+		}
+		pending = append(pending, store.PendingEvent{
+			ID:         event.ID,
+			DeviceID:   d.ID,
+			OccurredAt: at,
+			Type:       event.Type,
+			Severity:   event.Severity,
+			Message:    event.Message,
+			Meta:       meta,
+		})
+	}
+	_ = s.st.QueueEvents(d.ID, pending)
 	writeJSON(w, http.StatusOK, map[string]any{"ok": true})
 }
 
@@ -322,6 +402,11 @@ func queryIntPtr(r *http.Request, key string) *int {
 		return nil
 	}
 	return &n
+}
+
+func (s *Server) headName() string {
+	name, _ := s.branchHeadName.Load().(string)
+	return name
 }
 
 func writeJSON(w http.ResponseWriter, code int, v any) {

@@ -4,17 +4,22 @@ import (
 	"log"
 	"os"
 	"os/signal"
+	"strings"
 	"syscall"
 	"time"
 
 	"foodtale/cms/internal/beacon"
 	"foodtale/cms/internal/config"
 	"foodtale/cms/internal/httpapi"
+	"foodtale/cms/internal/netutil"
 	"foodtale/cms/internal/sntp"
 	"foodtale/cms/internal/store"
 )
 
 func main() {
+	nameservers := os.Getenv("RESOLV_NAMESERVERS")
+	netutil.UseNameservers(nameservers)
+	caCount := netutil.UseSystemCAs()
 	cfg, err := config.Load()
 	if err != nil {
 		log.Fatal(err)
@@ -29,7 +34,7 @@ func main() {
 		log.Fatal(err)
 	}
 
-	log.Printf("foodtale cms id=%s data=%s", cfg.CMSID, cfg.DataDir)
+	log.Printf("foodtale cms id=%s data=%s dns=%s cas=%d", cfg.CMSID, cfg.DataDir, strings.Join(netutil.Nameservers(nameservers), ","), caCount)
 	log.Printf("admin %s  clock udp :%d  beacon udp :%d", cfg.AdvertiseURL(), cfg.ClockPort, cfg.BeaconPort)
 	go func() {
 		last := ""

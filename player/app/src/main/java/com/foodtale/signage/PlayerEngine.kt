@@ -6,6 +6,8 @@ import android.graphics.BitmapFactory
 import android.net.Uri
 import android.os.Handler
 import android.os.Looper
+import android.os.SystemClock
+import android.util.Log
 import android.view.View
 import android.widget.ImageView
 import androidx.media3.common.MediaItem
@@ -23,6 +25,7 @@ class PlayerEngine(
     ctx: Context,
     private val onEnded: () -> Unit,
     private val onReady: () -> Unit,
+    private val onEvent: (type: String, severity: String, message: String) -> Unit = { _, _, _ -> },
 ) {
     private val main = Handler(Looper.getMainLooper())
     private val app = ctx.applicationContext
@@ -49,6 +52,43 @@ class PlayerEngine(
         private set
     @Volatile var snapshotReady: Boolean = false
         private set
+    @Volatile private var frontRendered = false
+    @Volatile private var backRendered = false
+    @Volatile private var released = false
+    private var onPicture: (() -> Unit)? = null
+    private var lastSurfaceRecoverAt = 0L
+    private var blankRecoveries = 0
+
+    fun pictureOnScreen(): Boolean =
+        showingStill || showingHold || frontRendered || (snapshotPlaying && snapshotReady && snapshotPositionMs > 80L)
+
+    fun watchPicture(block: () -> Unit) {
+        onPicture = block
+    }
+
+    fun recoverBlankSurface() {
+        onMain {
+            if (showingStill || showingHold || showingGap || released) return@onMain
+            if (!front.playWhenReady) return@onMain
+            if (frontRendered) {
+                blankRecoveries = 0
+                return@onMain
+            }
+            val now = SystemClock.elapsedRealtime()
+            if (now - lastSurfaceRecoverAt < 5000L) return@onMain
+            lastSurfaceRecoverAt = now
+            blankRecoveries += 1
+            Log.w(TAG, "video surface blank recoveries=$blankRecoveries")
+            if (blankRecoveries >= 3) {
+                onEvent("player_rebuild", "error", "rebuilt video players")
+                rebuildPlayers()
+                blankRecoveries = 0
+            } else {
+                onEvent("surface_blank", "warn", "video surface blank recoveries=$blankRecoveries")
+                rebindViews()
+            }
+        }
+    }
 
     val player: ExoPlayer get() = front
 
@@ -143,6 +183,7 @@ class PlayerEngine(
         snapshotPlaying = true
         snapshotReady = true
         snapshotPositionMs = front.currentPosition
+        notifyPicture()
         return true
     }
 
@@ -156,6 +197,7 @@ class PlayerEngine(
         snapshotPlaying = false
         snapshotReady = true
         snapshotPositionMs = 0
+        notifyPicture()
         return true
     }
 
@@ -203,7 +245,8 @@ class PlayerEngine(
     }
 
     fun release() {
-        onMain {
+        released = true
+        val block = {
             hideStill()
             pendingBitmap?.recycle()
             pendingBitmap = null
@@ -211,6 +254,7 @@ class PlayerEngine(
             front.release()
             back.release()
         }
+        if (Looper.myLooper() == Looper.getMainLooper()) block() else main.post(block)
     }
 
     private fun showStill(file: File): Boolean {
@@ -227,6 +271,7 @@ class PlayerEngine(
         stillView?.visibility = View.VISIBLE
         front.playWhenReady = false
         front.pause()
+        notifyPicture()
         return true
     }
 
@@ -234,11 +279,13 @@ class PlayerEngine(
         showingStill = false
         stillView?.visibility = View.GONE
         stillView?.setImageDrawable(null)
+        notifyPicture()
     }
 
     private fun clearHold() {
         showingHold = false
         showingGap = false
+        notifyPicture()
     }
 
     private fun decodeStill(file: File) {
@@ -260,12 +307,51 @@ class PlayerEngine(
         return size
     }
 
+    private fun rebindViews() {
+        val vis = visibleView
+        val park = parkedView
+        vis?.player = null
+        park?.player = null
+        vis?.player = front
+        park?.player = back
+        if (front.playWhenReady) front.play()
+    }
+
+    private fun rebuildPlayers() {
+        val uri = front.currentMediaItem?.localConfiguration?.uri
+        val pos = front.currentPosition
+        val playing = front.playWhenReady
+        val mode = front.repeatMode
+        val speed = front.playbackParameters.speed
+        front.release()
+        back.release()
+        front = buildPlayer()
+        back = buildPlayer()
+        front.repeatMode = mode
+        front.playbackParameters = PlaybackParameters(speed)
+        front.volume = if (muted) 0f else 1f
+        back.volume = 0f
+        frontRendered = false
+        backRendered = false
+        rebindViews()
+        if (uri != null) {
+            front.setMediaItem(MediaItem.fromUri(uri))
+            front.prepare()
+            front.seekTo(pos.coerceAtLeast(0L))
+            front.playWhenReady = playing
+            if (playing) front.play()
+        }
+    }
+
     private fun swap() {
         hideStill()
         clearHold()
         val old = front
+        val oldFrontRendered = frontRendered
         front = back
         back = old
+        frontRendered = backRendered
+        backRendered = oldFrontRendered
         back.playWhenReady = false
         back.pause()
         back.volume = 0f
@@ -277,9 +363,16 @@ class PlayerEngine(
         snapshotPlaying = true
         snapshotReady = true
         snapshotPositionMs = front.currentPosition
+        notifyPicture()
     }
 
     private fun load(target: ExoPlayer, file: File) {
+        if (released) return
+        val same = sameFile(target, file) && target.mediaItemCount > 0
+        if (!same) {
+            if (target == front) frontRendered = false else backRendered = false
+            notifyPicture()
+        }
         target.playWhenReady = false
         val uri = Uri.fromFile(file)
         if (sameFile(target, file) && target.mediaItemCount > 0) {
@@ -309,6 +402,11 @@ class PlayerEngine(
             repeatMode = Player.REPEAT_MODE_OFF
             volume = 0f
             addListener(object : Player.Listener {
+                override fun onRenderedFirstFrame() {
+                    if (this@apply == front) frontRendered = true else backRendered = true
+                    notifyPicture()
+                }
+
                 override fun onPlaybackStateChanged(state: Int) {
                     if (showingStill || showingHold || showingGap) return
                     if (this@apply != front) {
@@ -339,7 +437,17 @@ class PlayerEngine(
             })
         }
 
+    private fun notifyPicture() {
+        val block = onPicture ?: return
+        onMain(block)
+    }
+
     private fun onMain(block: () -> Unit) {
+        if (released) return
         if (Looper.myLooper() == Looper.getMainLooper()) block() else main.post(block)
+    }
+
+    companion object {
+        private const val TAG = "PlayerEngine"
     }
 }

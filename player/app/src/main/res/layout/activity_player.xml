@@ -19,8 +19,10 @@
         android:layout_width="match_parent"
         android:layout_height="match_parent"
         android:keepScreenOn="true"
+        app:keep_content_on_player_reset="true"
         app:resize_mode="zoom"
-        app:surface_type="surface_view"
+        app:shutter_background_color="@android:color/transparent"
+        app:surface_type="texture_view"
         app:use_controller="false" />
 
     <ImageView
@@ -56,6 +58,52 @@
             android:text="In DMS, assign a published playlist to this device.\nThis screen starts playing on its own."
             android:textColor="#D0D0D0"
             android:textSize="24sp" />
+    </LinearLayout>
+
+    <LinearLayout
+        android:id="@+id/splash"
+        android:layout_width="match_parent"
+        android:layout_height="match_parent"
+        android:background="#2C3E50"
+        android:gravity="center"
+        android:orientation="vertical"
+        android:padding="48dp">
+
+        <ImageView
+            android:id="@+id/splashLogo"
+            android:layout_width="280dp"
+            android:layout_height="160dp"
+            android:contentDescription="@null"
+            android:scaleType="fitCenter"
+            android:visibility="gone" />
+
+        <TextView
+            android:id="@+id/splashBranch"
+            android:layout_width="wrap_content"
+            android:layout_height="wrap_content"
+            android:layout_marginTop="28dp"
+            android:textColor="#FFFFFF"
+            android:textSize="36sp"
+            android:textStyle="bold" />
+
+        <ProgressBar
+            android:id="@+id/splashBar"
+            style="?android:attr/progressBarStyleHorizontal"
+            android:layout_width="420dp"
+            android:layout_height="12dp"
+            android:layout_marginTop="36dp"
+            android:indeterminate="true"
+            android:max="1000"
+            android:progressBackgroundTint="#66FFFFFF"
+            android:progressTint="#FFFFFF" />
+
+        <TextView
+            android:id="@+id/splashTime"
+            android:layout_width="wrap_content"
+            android:layout_height="wrap_content"
+            android:layout_marginTop="12dp"
+            android:textColor="#FFFFFF"
+            android:textSize="18sp" />
     </LinearLayout>
 
     <View

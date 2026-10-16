@@ -8,6 +8,8 @@ import java.net.DatagramSocket
 import java.net.InetAddress
 import java.net.InetSocketAddress
 import java.nio.charset.StandardCharsets
+import java.util.concurrent.Executors
+import java.util.concurrent.RejectedExecutionException
 
 class PlayBus(
     ctx: Context,
@@ -19,19 +21,18 @@ class PlayBus(
     @Volatile var recvCount: Long = 0
         private set
     private var thread: Thread? = null
-    private var sendSock: DatagramSocket? = null
+    private val sender = Executors.newSingleThreadExecutor()
     private var multicastLock: WifiManager.MulticastLock? = null
 
     fun start() {
         if (running) return
         running = true
         acquireMulticast()
-        sendSock = DatagramSocket().apply { broadcast = true }
         thread = Thread {
             DatagramSocket(null).use { sock ->
                 sock.reuseAddress = true
                 sock.broadcast = true
-                sock.bind(InetSocketAddress(port))
+                sock.bind(InetSocketAddress(ipv4Any(), port))
                 sock.soTimeout = 1000
                 val buf = ByteArray(4096)
                 while (running) {
@@ -71,33 +72,49 @@ class PlayBus(
             .put("sendTime", msg.sendTime)
             .toString()
             .toByteArray(StandardCharsets.UTF_8)
-        val dests = LinkedHashSet<InetAddress>()
+        if (sender.isShutdown) return
+        val hosts = extraHosts.map { it.trim() }.filter { it.isNotBlank() && it != "127.0.0.1" && it != "::1" }
         try {
-            dests.add(InetAddress.getByName("255.255.255.255"))
-        } catch (_: Exception) {
-        }
-        subnetBroadcast()?.let { dests.add(it) }
-        for (host in extraHosts) {
-            val h = host.trim()
-            if (h.isBlank() || h == "127.0.0.1" || h == "::1") continue
+            sender.execute {
+            val peers = LinkedHashSet<InetAddress>()
+            for (host in hosts) {
+                try {
+                    peers.add(InetAddress.getByName(host))
+                } catch (_: Exception) {
+                }
+            }
+            if (peers.isNotEmpty()) {
+                try {
+                    DatagramSocket().use { sock ->
+                        for (addr in peers) {
+                            try {
+                                sock.send(DatagramPacket(json, json.size, addr, port))
+                            } catch (_: Exception) {
+                            }
+                        }
+                    }
+                } catch (_: Exception) {
+                }
+            }
             try {
-                dests.add(InetAddress.getByName(h))
+                DatagramSocket().use { sock ->
+                    sock.broadcast = true
+                    sock.send(DatagramPacket(json, json.size, InetAddress.getByName("255.255.255.255"), port))
+                    subnetBroadcast()?.let { bcast ->
+                        sock.send(DatagramPacket(json, json.size, bcast, port))
+                    }
+                }
             } catch (_: Exception) {
             }
         }
-        for (addr in dests) {
-            try {
-                sendSock?.send(DatagramPacket(json, json.size, addr, port))
-            } catch (_: Exception) {
-            }
+        } catch (_: RejectedExecutionException) {
         }
     }
 
     fun stop() {
         running = false
         thread?.interrupt()
-        sendSock?.close()
-        sendSock = null
+        sender.shutdownNow()
         try {
             multicastLock?.release()
         } catch (_: Exception) {
@@ -115,6 +132,8 @@ class PlayBus(
         } catch (_: Exception) {
         }
     }
+
+    private fun ipv4Any(): InetAddress = InetAddress.getByName("0.0.0.0")
 
     @Suppress("DEPRECATION")
     private fun subnetBroadcast(): InetAddress? {

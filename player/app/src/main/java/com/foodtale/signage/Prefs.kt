@@ -56,6 +56,18 @@ object Prefs {
     fun followedHeadId(): Long = p.getLong("followedHeadId", 0)
     fun followedHeadId(v: Long) { p.edit().putLong("followedHeadId", v).apply() }
 
+    fun playbackLead(): Long = p.getLong("playbackLead", 0)
+    fun playbackLead(v: Long) { p.edit().putLong("playbackLead", v).apply() }
+
+    fun brandBranch(): String = p.getString("brandBranch", "") ?: ""
+    fun brandBranch(v: String) { p.edit().putString("brandBranch", v).apply() }
+
+    fun brandColor(): String = p.getString("brandColor", "") ?: ""
+    fun brandColor(v: String) { p.edit().putString("brandColor", v).apply() }
+
+    fun brandLogo(): String = p.getString("brandLogo", "") ?: ""
+    fun brandLogo(v: String) { p.edit().putString("brandLogo", v).apply() }
+
     fun installationId(): String {
         var id = p.getString("installationId", "") ?: ""
         if (id.isBlank()) {

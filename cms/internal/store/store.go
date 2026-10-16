@@ -161,7 +161,209 @@ CREATE TABLE IF NOT EXISTS dms_choice (
 	if err != nil {
 		return err
 	}
+	_, _ = s.db.Exec(`
+CREATE TABLE IF NOT EXISTS device_telemetry (
+  device_id INTEGER PRIMARY KEY,
+  speed REAL,
+  drift_ms INTEGER,
+  lead_ms INTEGER,
+  phase TEXT NOT NULL DEFAULT '',
+  app_version TEXT NOT NULL DEFAULT '',
+  played_ms INTEGER NOT NULL DEFAULT 0,
+  played_token TEXT NOT NULL DEFAULT ''
+);
+CREATE TABLE IF NOT EXISTS device_events (
+  id TEXT PRIMARY KEY,
+  device_id INTEGER NOT NULL,
+  occurred_at TEXT NOT NULL,
+  type TEXT NOT NULL,
+  severity TEXT NOT NULL,
+  message TEXT NOT NULL,
+  meta TEXT NOT NULL DEFAULT ''
+);
+CREATE INDEX IF NOT EXISTS device_events_device ON device_events(device_id, occurred_at);
+`)
+	_, _ = s.db.Exec(`ALTER TABLE device_telemetry ADD COLUMN played_token TEXT NOT NULL DEFAULT ''`)
+	_, _ = s.db.Exec(`ALTER TABLE device_telemetry ADD COLUMN drift_abs_sum INTEGER NOT NULL DEFAULT 0`)
+	_, _ = s.db.Exec(`ALTER TABLE device_telemetry ADD COLUMN drift_samples INTEGER NOT NULL DEFAULT 0`)
+	_, _ = s.db.Exec(`ALTER TABLE device_telemetry ADD COLUMN speed_nudges INTEGER NOT NULL DEFAULT 0`)
+	_, _ = s.db.Exec(`ALTER TABLE device_telemetry ADD COLUMN uptime_ms INTEGER NOT NULL DEFAULT 0`)
+	_, err = s.db.Exec(`
+CREATE TABLE IF NOT EXISTS dms_schedule (
+  local_device_id INTEGER PRIMARY KEY,
+  screen_row INTEGER NOT NULL,
+  body TEXT NOT NULL
+);
+`)
+	if err != nil {
+		return err
+	}
 	return s.rebuildPlaybackIfNeeded()
+}
+
+type Telemetry struct {
+	Speed        *float64
+	DriftMs      *int
+	LeadMs       *int
+	Phase        string
+	AppVersion   string
+	PlayedMs     int64
+	DriftAbsSum  int64
+	DriftSamples int
+	SpeedNudges  int
+	UptimeMs     int64
+}
+
+type PendingEvent struct {
+	ID         string
+	DeviceID   int64
+	OccurredAt string
+	Type       string
+	Severity   string
+	Message    string
+	Meta       string
+}
+
+func (s *Store) SaveTelemetry(deviceID int64, tel Telemetry, addPlayed int64, token string) error {
+	if addPlayed < 0 {
+		addPlayed = 0
+	}
+	token = strings.TrimSpace(token)
+	var current string
+	_ = s.db.QueryRow(`SELECT played_token FROM device_telemetry WHERE device_id=?`, deviceID).Scan(&current)
+	add := addPlayed
+	addDrift := tel.DriftAbsSum
+	addSamples := tel.DriftSamples
+	addNudges := tel.SpeedNudges
+	if token != "" && token == current {
+		add = 0
+		addDrift = 0
+		addSamples = 0
+		addNudges = 0
+	}
+	if addDrift < 0 {
+		addDrift = 0
+	}
+	if addSamples < 0 {
+		addSamples = 0
+	}
+	if addNudges < 0 {
+		addNudges = 0
+	}
+	uptime := tel.UptimeMs
+	if uptime < 0 {
+		uptime = 0
+	}
+	_, err := s.db.Exec(`
+INSERT INTO device_telemetry(device_id, speed, drift_ms, lead_ms, phase, app_version, played_ms, played_token, drift_abs_sum, drift_samples, speed_nudges, uptime_ms)
+VALUES(?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+ON CONFLICT(device_id) DO UPDATE SET
+  speed=excluded.speed,
+  drift_ms=excluded.drift_ms,
+  lead_ms=excluded.lead_ms,
+  phase=excluded.phase,
+  app_version=excluded.app_version,
+  played_ms=device_telemetry.played_ms + ?,
+  played_token=excluded.played_token,
+  drift_abs_sum=device_telemetry.drift_abs_sum + ?,
+  drift_samples=device_telemetry.drift_samples + ?,
+  speed_nudges=device_telemetry.speed_nudges + ?,
+  uptime_ms=excluded.uptime_ms
+`, deviceID, tel.Speed, tel.DriftMs, tel.LeadMs, tel.Phase, tel.AppVersion, add, token, addDrift, addSamples, addNudges, uptime, add, addDrift, addSamples, addNudges)
+	return err
+}
+
+func (s *Store) Telemetry(deviceID int64) (Telemetry, error) {
+	row := s.db.QueryRow(
+		`SELECT speed, drift_ms, lead_ms, phase, app_version, played_ms, drift_abs_sum, drift_samples, speed_nudges, uptime_ms FROM device_telemetry WHERE device_id=?`,
+		deviceID,
+	)
+	var tel Telemetry
+	var speed sql.NullFloat64
+	var drift, lead sql.NullInt64
+	err := row.Scan(&speed, &drift, &lead, &tel.Phase, &tel.AppVersion, &tel.PlayedMs, &tel.DriftAbsSum, &tel.DriftSamples, &tel.SpeedNudges, &tel.UptimeMs)
+	if err == sql.ErrNoRows {
+		return Telemetry{}, nil
+	}
+	if err != nil {
+		return Telemetry{}, err
+	}
+	if speed.Valid {
+		v := speed.Float64
+		tel.Speed = &v
+	}
+	if drift.Valid {
+		v := int(drift.Int64)
+		tel.DriftMs = &v
+	}
+	if lead.Valid {
+		v := int(lead.Int64)
+		tel.LeadMs = &v
+	}
+	return tel, nil
+}
+
+func (s *Store) QueueEvents(deviceID int64, events []PendingEvent) error {
+	for _, event := range events {
+		id := strings.TrimSpace(event.ID)
+		if id == "" || strings.TrimSpace(event.Type) == "" {
+			continue
+		}
+		at := strings.TrimSpace(event.OccurredAt)
+		if at == "" {
+			at = nowRFC()
+		}
+		severity := event.Severity
+		if severity == "" {
+			severity = "info"
+		}
+		_, err := s.db.Exec(
+			`INSERT OR IGNORE INTO device_events(id, device_id, occurred_at, type, severity, message, meta) VALUES(?, ?, ?, ?, ?, ?, ?)`,
+			id, deviceID, at, event.Type, severity, event.Message, event.Meta,
+		)
+		if err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+func (s *Store) TakeEvents(deviceID int64, limit int) ([]PendingEvent, error) {
+	if limit <= 0 {
+		limit = 50
+	}
+	rows, err := s.db.Query(
+		`SELECT id, device_id, occurred_at, type, severity, message, meta FROM device_events WHERE device_id=? ORDER BY occurred_at LIMIT ?`,
+		deviceID, limit,
+	)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	out := []PendingEvent{}
+	for rows.Next() {
+		var event PendingEvent
+		if err := rows.Scan(&event.ID, &event.DeviceID, &event.OccurredAt, &event.Type, &event.Severity, &event.Message, &event.Meta); err != nil {
+			return nil, err
+		}
+		out = append(out, event)
+	}
+	return out, rows.Err()
+}
+
+func (s *Store) AckReport(deviceID int64, eventIDs []string) error {
+	if _, err := s.db.Exec(`UPDATE device_telemetry SET played_ms=0, drift_abs_sum=0, drift_samples=0, speed_nudges=0 WHERE device_id=?`, deviceID); err != nil {
+		return err
+	}
+	for _, id := range eventIDs {
+		if strings.TrimSpace(id) == "" {
+			continue
+		}
+		if _, err := s.db.Exec(`DELETE FROM device_events WHERE id=? AND device_id=?`, id, deviceID); err != nil {
+			return err
+		}
+	}
+	return nil
 }
 
 func (s *Store) rebuildPlaybackIfNeeded() error {
@@ -503,6 +705,43 @@ func (s *Store) SaveDmsPlayback(dmsPlaylistID, mediaAssetID int64, generation in
 		dmsPlaylistID, mediaAssetID, generation, localID,
 	)
 	return err
+}
+
+func (s *Store) SaveDeviceSchedule(deviceID int64, screenRow int, body string) error {
+	_, err := s.db.Exec(
+		`INSERT INTO dms_schedule(local_device_id, screen_row, body) VALUES(?,?,?)
+		 ON CONFLICT(local_device_id) DO UPDATE SET screen_row=excluded.screen_row, body=excluded.body`,
+		deviceID, screenRow, body,
+	)
+	return err
+}
+
+func (s *Store) ClearDeviceSchedule(deviceID int64) error {
+	_, err := s.db.Exec(`DELETE FROM dms_schedule WHERE local_device_id=?`, deviceID)
+	return err
+}
+
+type StoredSchedule struct {
+	DeviceID  int64
+	ScreenRow int
+	Body      string
+}
+
+func (s *Store) DeviceSchedules() ([]StoredSchedule, error) {
+	rows, err := s.db.Query(`SELECT local_device_id, screen_row, body FROM dms_schedule`)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	out := []StoredSchedule{}
+	for rows.Next() {
+		var row StoredSchedule
+		if err := rows.Scan(&row.DeviceID, &row.ScreenRow, &row.Body); err != nil {
+			return nil, err
+		}
+		out = append(out, row)
+	}
+	return out, rows.Err()
 }
 
 func (s *Store) MoveItem(id int64, delta int) error {
