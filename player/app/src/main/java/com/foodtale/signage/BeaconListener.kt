@@ -8,6 +8,7 @@ import java.nio.charset.StandardCharsets
 
 class BeaconListener(
     private val port: Int = 48720,
+    private val onFailover: (FailoverNotice) -> Unit = {},
     private val onBeacon: (Beacon) -> Unit,
 ) {
     @Volatile private var running = false
@@ -30,16 +31,25 @@ class BeaconListener(
                             val pkt = DatagramPacket(buf, buf.size)
                             sock.receive(pkt)
                             val json = JSONObject(String(pkt.data, 0, pkt.length, StandardCharsets.UTF_8))
-                            if (json.optString("service") != "foodtale-cms") continue
-                            onBeacon(
-                                Beacon(
-                                    v = json.optInt("v", 1),
-                                    service = json.optString("service"),
-                                    cmsId = json.optString("cmsId"),
-                                    http = json.optString("http").trimEnd('/'),
-                                    clockPort = json.optInt("clockPort", 8123),
+                            when (json.optString("service")) {
+                                "foodtale-failover" -> onFailover(
+                                    FailoverNotice(
+                                        originCmsId = json.optString("originCmsId"),
+                                        dmsDeviceId = json.optLong("dmsDeviceId"),
+                                    )
                                 )
-                            )
+                                "foodtale-cms" -> onBeacon(
+                                    Beacon(
+                                        v = json.optInt("v", 1),
+                                        service = json.optString("service"),
+                                        cmsId = json.optString("cmsId"),
+                                        http = json.optString("http").trimEnd('/'),
+                                        clockPort = json.optInt("clockPort", 8123),
+                                        role = json.optString("role"),
+                                        originCmsId = json.optString("originCmsId"),
+                                    )
+                                )
+                            }
                         } catch (_: Exception) {
                         }
                     }

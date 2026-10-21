@@ -20,8 +20,13 @@ func (s *Server) submitReport() {
 		return
 	}
 	head, err := s.st.DmsClaimByRole("head")
+	acting := false
 	if err != nil || head == nil || !head.Claimed {
-		return
+		head, err = s.st.DmsClaimByRole("acting")
+		if err != nil || head == nil || !head.Claimed {
+			return
+		}
+		acting = true
 	}
 	claims, err := s.st.DmsClaims()
 	if err != nil {
@@ -102,19 +107,25 @@ func (s *Server) submitReport() {
 		_ = s.st.AckReport(ack.deviceID, ack.eventIDs)
 	}
 	s.applyBrand(client, head.Code, brand)
-	demoted := false
-	for _, result := range results {
-		if result.Code == head.Code && !result.IsHead {
-			demoted = true
-			s.branchHead.Store(false)
-			if result.HeadDeviceID != 0 {
-				s.branchHeadID.Store(result.HeadDeviceID)
-				s.branchHeadName.Store(result.HeadDeviceName)
+	if !acting {
+		demoted := false
+		for _, result := range results {
+			if result.Code == head.Code && !result.IsHead {
+				demoted = true
+				s.branchHead.Store(false)
+				if result.HeadDeviceID != 0 {
+					s.branchHeadID.Store(result.HeadDeviceID)
+					s.branchHeadName.Store(result.HeadDeviceName)
+				}
 			}
 		}
-	}
-	if demoted {
-		return
+		if demoted {
+			act, _, ok := s.useActing(client, head)
+			if !ok {
+				return
+			}
+			head = act
+		}
 	}
 	byCode := map[string]dms.ReportResult{}
 	for _, result := range results {

@@ -11,8 +11,8 @@ android {
         applicationId = "com.foodtale.signage"
         minSdk = 24
         targetSdk = 35
-        versionCode = 55
-        versionName = "0.2.54"
+        versionCode = 62
+        versionName = "0.2.61"
     }
 
     flavorDimensions += "role"

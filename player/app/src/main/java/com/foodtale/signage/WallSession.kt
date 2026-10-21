@@ -95,7 +95,10 @@ class WallSession(
         if (m.items.isNotEmpty()) Prefs.manifestJson(m.toJson().toString())
         onMain {
             Prefs.deviceId(m.deviceId)
-            if (m.cmsId.isNotBlank()) Prefs.cmsId(m.cmsId)
+            val origin = Prefs.originCmsId()
+            if (m.cmsId.isNotBlank() && (origin.isBlank() || m.cmsId == origin)) {
+                Prefs.cmsId(m.cmsId)
+            }
             engine.mute(!m.isLeader)
             if (prev != null && prev.syncGeneration != m.syncGeneration) {
                 telemetry.event("generation_changed", "info", "playlist generation ${m.syncGeneration}")
@@ -114,6 +117,18 @@ class WallSession(
                 armAxis()
             }
             noteLoad()
+            paintHud()
+        }
+    }
+
+    fun dropManifest() {
+        onMain {
+            manifest = null
+            playArmed = false
+            queuedStart = null
+            cancelPlay()
+            cancelPulse()
+            lastDrop = ""
             paintHud()
         }
     }

@@ -64,6 +64,37 @@ class CmsApi {
 
     fun joinClaim(base: String, code: String): JSONObject = postCode("${base.trimEnd('/')}/api/claim/join", code)
 
+    fun claimActing(base: String, code: String): JSONObject {
+        val normalized = code.trim().uppercase()
+        val payload = JSONObject().put("code", normalized).toString()
+        val req = Request.Builder()
+            .url("${base.trimEnd('/')}/api/claims/$normalized/acting")
+            .post(payload.toRequestBody("application/json".toMediaType()))
+            .build()
+        return readJson(req, "acting")
+    }
+
+    fun clearActing(base: String, code: String) {
+        val normalized = code.trim().uppercase()
+        val req = Request.Builder()
+            .url("${base.trimEnd('/')}/api/claims/$normalized/acting")
+            .delete()
+            .build()
+        readJson(req, "acting")
+    }
+
+    fun adoptActing(base: String, code: String, originCmsId: String): JSONObject {
+        val payload = JSONObject()
+            .put("code", code.trim().uppercase())
+            .put("origin_cms_id", originCmsId)
+            .toString()
+        val req = Request.Builder()
+            .url("${base.trimEnd('/')}/api/claim/adopt-acting")
+            .post(payload.toRequestBody("application/json".toMediaType()))
+            .build()
+        return readJson(req, "adopt-acting")
+    }
+
     private fun postCode(url: String, code: String): JSONObject {
         val payload = JSONObject().put("code", code.trim().uppercase()).toString()
         val req = Request.Builder()

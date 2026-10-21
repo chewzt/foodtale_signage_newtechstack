@@ -52,6 +52,7 @@ func Listen(cfg *config.Config, st *store.Store) error {
 	r.Get("/api/claim/head", s.claimHead)
 	r.Post("/api/claim/screen", s.claimScreen)
 	r.Post("/api/claim/adopt", s.adoptClaim)
+	r.Post("/api/claim/adopt-acting", s.adoptActing)
 	r.Post("/api/claim/join", s.joinClaim)
 	r.Get("/api/device/manifest", s.manifest)
 	r.Post("/api/device/heartbeat", s.heartbeat)
@@ -284,6 +285,8 @@ func (s *Server) manifestBody(d *store.Device) map[string]any {
 	leaderID := int64(0)
 	if head, err := s.st.DmsClaimByRole("head"); err == nil && head != nil && head.Claimed {
 		leaderID = head.LocalDeviceID
+	} else if acting, err := s.st.DmsClaimByRole("acting"); err == nil && acting != nil && acting.Claimed {
+		leaderID = acting.LocalDeviceID
 	}
 	return map[string]any{
 		"playlist_name":    pl.Name,

@@ -94,6 +94,8 @@ type Role struct {
 	DeviceID       int64  `json:"device_id"`
 	BranchID       int64  `json:"branch_id"`
 	IsHead         bool   `json:"is_head"`
+	IsActing       bool   `json:"is_acting"`
+	ActingDeviceID int64  `json:"acting_device_id"`
 	HeadDeviceID   int64  `json:"head_device_id"`
 	HeadDeviceName string `json:"head_device_name"`
 }

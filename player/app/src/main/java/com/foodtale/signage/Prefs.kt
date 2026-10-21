@@ -22,6 +22,18 @@ object Prefs {
     fun cmsId(): String = p.getString("cmsId", "") ?: ""
     fun cmsId(v: String) { p.edit().putString("cmsId", v).apply() }
 
+    fun originCmsId(): String = p.getString("originCmsId", "") ?: ""
+    fun originCmsId(v: String) { p.edit().putString("originCmsId", v).apply() }
+
+    fun dmsDeviceId(): Long = p.getLong("dmsDeviceId", 0)
+    fun dmsDeviceId(v: Long) { p.edit().putLong("dmsDeviceId", v).apply() }
+
+    fun acting(): Boolean = p.getBoolean("acting", false)
+    fun acting(v: Boolean) { p.edit().putBoolean("acting", v).apply() }
+
+    fun followingActing(): Boolean = p.getBoolean("followingActing", false)
+    fun followingActing(v: Boolean) { p.edit().putBoolean("followingActing", v).apply() }
+
     fun http(): String = p.getString("http", "") ?: ""
     fun http(v: String) { p.edit().putString("http", v.trimEnd('/')).apply() }
 

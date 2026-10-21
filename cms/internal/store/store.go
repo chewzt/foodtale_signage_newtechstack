@@ -1050,7 +1050,11 @@ func (s *Store) Touch(deviceID int64, offsetMs, rttMs *int, playIndex *int, play
 
 func (s *Store) Peers(playlistID, selfID int64) ([]Peer, error) {
 	rows, err := s.db.Query(
-		`SELECT id, name, IFNULL(last_ip,'') FROM devices WHERE playlist_id=? AND device_token IS NOT NULL ORDER BY id`, playlistID,
+		`SELECT d.id, d.name, IFNULL(d.last_ip,'')
+		 FROM devices d
+		 JOIN dms_claims c ON c.local_device_id = d.id AND c.claimed = 1
+		 WHERE d.playlist_id = ? AND d.device_token IS NOT NULL
+		 ORDER BY d.id`, playlistID,
 	)
 	if err != nil {
 		return nil, err
@@ -1110,7 +1114,7 @@ func (s *Store) SaveDmsClaim(claim DmsClaim) error {
 }
 
 func (s *Store) DmsClaimByCode(code string) (*DmsClaim, error) {
-	row := s.db.QueryRow(`SELECT local_device_id, role, code, claimed FROM dms_claims WHERE code=?`, code)
+	row := s.db.QueryRow(`SELECT local_device_id, role, code, claimed FROM dms_claims WHERE code=? ORDER BY claimed DESC, local_device_id LIMIT 1`, code)
 	return scanDmsClaim(row.Scan)
 }
 

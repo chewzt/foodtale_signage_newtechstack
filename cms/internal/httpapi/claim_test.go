@@ -14,6 +14,7 @@ import (
 	"testing"
 	"time"
 
+	"foodtale/cms/internal/beacon"
 	"foodtale/cms/internal/config"
 	"foodtale/cms/internal/dms"
 	"foodtale/cms/internal/store"
@@ -523,5 +524,144 @@ func TestWallScreensShareOnePlaylistAndOneLeader(t *testing.T) {
 	items, _ := body["items"].([]map[string]any)
 	if len(items) != 1 || items[0]["duration_ms"] != 8000 {
 		t.Fatalf("screen saw another row: %+v", items)
+	}
+}
+
+func TestAdoptActingJoinsSameBranchOnly(t *testing.T) {
+	sms := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch {
+		case strings.HasSuffix(r.URL.Path, "/ACT1/role"):
+			_, _ = io.WriteString(w, `{"device_id":5,"branch_id":1,"is_head":false,"is_acting":true,"acting_device_id":5,"head_device_id":9,"head_device_name":"T95"}`)
+		case strings.HasSuffix(r.URL.Path, "/GUEST/role"):
+			_, _ = io.WriteString(w, `{"device_id":6,"branch_id":1,"is_head":false,"is_acting":false,"acting_device_id":5,"head_device_id":9,"head_device_name":"T95"}`)
+		case strings.HasSuffix(r.URL.Path, "/OTHER/role"):
+			_, _ = io.WriteString(w, `{"device_id":7,"branch_id":2,"is_head":false,"is_acting":false,"acting_device_id":0,"head_device_id":8,"head_device_name":"X"}`)
+		case strings.HasSuffix(r.URL.Path, "/PLAIN/role"):
+			_, _ = io.WriteString(w, `{"device_id":4,"branch_id":1,"is_head":false,"is_acting":false,"acting_device_id":0,"head_device_id":9,"head_device_name":"T95"}`)
+		default:
+			http.NotFound(w, r)
+		}
+	}))
+	defer sms.Close()
+
+	dir := t.TempDir()
+	st, err := store.Open(filepath.Join(dir, "cms.db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer st.Close()
+	s := &Server{cfg: &config.Config{CMSID: "cms-temp", DMSPublicURL: sms.URL, HTTPPort: 8080}, st: st}
+
+	rec := httptest.NewRecorder()
+	s.adoptActing(rec, httptest.NewRequest(http.MethodPost, "/api/claim/adopt-acting", strings.NewReader(`{"code":"PLAIN","origin_cms_id":"cms-origin"}`)))
+	if rec.Code != http.StatusConflict {
+		t.Fatalf("screen adopt-acting %d %s", rec.Code, rec.Body.String())
+	}
+
+	rec = httptest.NewRecorder()
+	s.adoptClaim(rec, httptest.NewRequest(http.MethodPost, "/api/claim/adopt", strings.NewReader(`{"code":"ACT1"}`)))
+	if rec.Code != http.StatusConflict {
+		t.Fatalf("acting code adoptClaim %d %s", rec.Code, rec.Body.String())
+	}
+
+	rec = httptest.NewRecorder()
+	s.adoptActing(rec, httptest.NewRequest(http.MethodPost, "/api/claim/adopt-acting", strings.NewReader(`{"code":"ACT1","origin_cms_id":"cms-origin"}`)))
+	if rec.Code != http.StatusOK {
+		t.Fatalf("adopt-acting %d %s", rec.Code, rec.Body.String())
+	}
+	pkt := beacon.Current(s.cfg, "http://10.0.0.8:8080")
+	if pkt.Role != "acting" || pkt.OriginCMSID != "cms-origin" || pkt.CMSID != "cms-temp" {
+		t.Fatalf("beacon %+v", pkt)
+	}
+
+	rec = httptest.NewRecorder()
+	s.joinClaim(rec, httptest.NewRequest(http.MethodPost, "/api/claim/join", strings.NewReader(`{"code":"GUEST"}`)))
+	if rec.Code != http.StatusOK {
+		t.Fatalf("same branch join %d %s", rec.Code, rec.Body.String())
+	}
+
+	rec = httptest.NewRecorder()
+	s.joinClaim(rec, httptest.NewRequest(http.MethodPost, "/api/claim/join", strings.NewReader(`{"code":"OTHER"}`)))
+	if rec.Code != http.StatusUnprocessableEntity {
+		t.Fatalf("other branch join %d %s", rec.Code, rec.Body.String())
+	}
+}
+
+func TestStaleLocalHeadDoesNotBlockActing(t *testing.T) {
+	fake := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch {
+		case r.Method == http.MethodGet && strings.HasSuffix(r.URL.Path, "/ACT1/role"):
+			_, _ = io.WriteString(w, `{"device_id":20,"branch_id":1,"is_head":false,"is_acting":true,"acting_device_id":20,"head_device_id":22,"head_device_name":"T95"}`)
+		case r.Method == http.MethodGet && strings.HasSuffix(r.URL.Path, "/GUEST/role"):
+			_, _ = io.WriteString(w, `{"device_id":60,"branch_id":1,"is_head":false,"is_acting":false,"acting_device_id":20,"head_device_id":22,"head_device_name":"T95"}`)
+		case r.Method == http.MethodPost && strings.HasSuffix(r.URL.Path, "/ACT1/report"):
+			_, _ = io.WriteString(w, `{"devices":[{"code":"ACT1","revoked":false,"is_head":false,"head_device_id":22,"head_device_name":"T95","playback":{"assigned":true,"playlist_id":4,"playlist_name":"Wall","media_asset_id":3,"generation":36,"items":[{"id":21,"name":"clip","type":"video","media_asset_id":3,"duration_ms":4000}]}}],"brand":{"branch_name":"","primary_color":"","logo_url":"","logo_version":""}}`)
+		case r.Method == http.MethodGet && strings.Contains(r.URL.Path, "/items/") && strings.HasSuffix(r.URL.Path, "/file"):
+			_, _ = io.WriteString(w, "video-bytes")
+		default:
+			http.NotFound(w, r)
+		}
+	}))
+	defer fake.Close()
+
+	dir := t.TempDir()
+	st, err := store.Open(filepath.Join(dir, "cms.db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer st.Close()
+	kept, err := st.PrepareClaimDevice("Head")
+	if err != nil {
+		t.Fatal(err)
+	}
+	blank, err := st.PrepareClaimDevice("Screen")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := st.SaveDmsClaim(store.DmsClaim{LocalDeviceID: kept.ID, Role: "head", Code: "ACT1", Claimed: true}); err != nil {
+		t.Fatal(err)
+	}
+	if err := st.SaveDmsClaim(store.DmsClaim{LocalDeviceID: blank.ID, Role: "acting", Code: "ACT1", Claimed: true}); err != nil {
+		t.Fatal(err)
+	}
+	s := &Server{cfg: &config.Config{CMSID: "cms-temp", DMSPublicURL: fake.URL, DataDir: dir, HTTPPort: 8080}, st: st}
+
+	rec := httptest.NewRecorder()
+	s.joinClaim(rec, httptest.NewRequest(http.MethodPost, "/api/claim/join", strings.NewReader(`{"code":"GUEST"}`)))
+	if rec.Code != http.StatusOK {
+		t.Fatalf("join past stale head %d %s", rec.Code, rec.Body.String())
+	}
+	retired, err := st.DmsClaimByDevice(kept.ID)
+	if err != nil || retired == nil || retired.Claimed || retired.Role == "head" {
+		t.Fatalf("stale head still claimed: %+v err %v", retired, err)
+	}
+
+	if err := st.SaveDmsClaim(store.DmsClaim{LocalDeviceID: kept.ID, Role: "head", Code: "ACT1", Claimed: true}); err != nil {
+		t.Fatal(err)
+	}
+	s.submitReport()
+	updated, err := st.DeviceByID(blank.ID)
+	if err != nil || updated.PlaylistID == nil {
+		t.Fatalf("acting device did not take the playback update: %+v err %v", updated, err)
+	}
+	retired, err = st.DmsClaimByDevice(kept.ID)
+	if err != nil || retired == nil || retired.Role == "head" && retired.Claimed {
+		t.Fatalf("report left the stale head in place: %+v", retired)
+	}
+
+	if err := st.SaveDmsClaim(store.DmsClaim{LocalDeviceID: kept.ID, Role: "head", Code: "ACT1", Claimed: true}); err != nil {
+		t.Fatal(err)
+	}
+	rec = httptest.NewRecorder()
+	s.adoptActing(rec, httptest.NewRequest(http.MethodPost, "/api/claim/adopt-acting", strings.NewReader(`{"code":"ACT1","origin_cms_id":"cms-origin"}`)))
+	if rec.Code != http.StatusOK {
+		t.Fatalf("adopt-acting %d %s", rec.Code, rec.Body.String())
+	}
+	var adopted claimResponse
+	if err := json.Unmarshal(rec.Body.Bytes(), &adopted); err != nil {
+		t.Fatal(err)
+	}
+	if adopted.DeviceID != kept.ID {
+		t.Fatalf("adopt created a blank device %d, playlist device is %d", adopted.DeviceID, kept.ID)
 	}
 }

@@ -7,6 +7,7 @@ import (
 	"strings"
 	"time"
 
+	"foodtale/cms/internal/beacon"
 	"foodtale/cms/internal/dms"
 	"foodtale/cms/internal/store"
 )
@@ -68,6 +69,51 @@ func (s *Server) adoptClaim(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, err.Error(), http.StatusInternalServerError)
 		return
 	}
+	beacon.SetHead()
+	writeJSON(w, http.StatusOK, s.claimPayload(dev, claim, true))
+}
+
+func (s *Server) adoptActing(w http.ResponseWriter, r *http.Request) {
+	if strings.TrimSpace(s.cfg.DMSPublicURL) == "" {
+		http.Error(w, "dms url missing", http.StatusServiceUnavailable)
+		return
+	}
+	var body struct {
+		Code        string `json:"code"`
+		OriginCmsID string `json:"origin_cms_id"`
+	}
+	if err := json.NewDecoder(io.LimitReader(r.Body, 1<<20)).Decode(&body); err != nil {
+		http.Error(w, "bad json", http.StatusBadRequest)
+		return
+	}
+	code := strings.ToUpper(strings.TrimSpace(body.Code))
+	origin := strings.TrimSpace(body.OriginCmsID)
+	if code == "" || origin == "" {
+		http.Error(w, "bad json", http.StatusBadRequest)
+		return
+	}
+	role, err := dms.New(s.cfg.DMSPublicURL).Role(code)
+	if err != nil {
+		http.Error(w, err.Error(), http.StatusBadGateway)
+		return
+	}
+	if !role.IsActing || role.ActingDeviceID != role.DeviceID {
+		http.Error(w, "not the temp head", http.StatusConflict)
+		return
+	}
+	dev, claim, err := s.reuseOrCreateActing(code)
+	if err != nil {
+		http.Error(w, err.Error(), http.StatusInternalServerError)
+		return
+	}
+	claim.Code = code
+	claim.Claimed = true
+	claim.Role = "acting"
+	if err := s.st.SaveDmsClaim(*claim); err != nil {
+		http.Error(w, err.Error(), http.StatusInternalServerError)
+		return
+	}
+	beacon.SetActing(origin)
 	writeJSON(w, http.StatusOK, s.claimPayload(dev, claim, true))
 }
 
@@ -81,14 +127,9 @@ func (s *Server) joinClaim(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, "bad json", http.StatusBadRequest)
 		return
 	}
-	self, err := s.st.DmsClaimByRole("head")
-	if err != nil || self == nil || !self.Claimed {
-		http.Error(w, "cms is not the branch head", http.StatusConflict)
-		return
-	}
 	client := dms.New(s.cfg.DMSPublicURL)
-	selfRole, err := client.Role(self.Code)
-	if err != nil || !selfRole.IsHead {
+	self, selfRole, _, ok := s.servingClaim(client)
+	if !ok {
 		http.Error(w, "cms is not the branch head", http.StatusConflict)
 		return
 	}
@@ -132,6 +173,114 @@ func (s *Server) joinClaim(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	writeJSON(w, http.StatusOK, s.claimPayload(dev, &claim, true))
+}
+
+// reuseOrCreateActing keeps the local device that already has the playlist.
+// A claimed head row in this file is stale once this process is only the temp head.
+func (s *Server) dropRetiredPeers() {
+	claims, err := s.st.DmsClaims()
+	if err != nil {
+		return
+	}
+	for _, claim := range claims {
+		if claim.Role != "retired" {
+			continue
+		}
+		_ = s.st.Unassign(claim.LocalDeviceID)
+	}
+}
+
+func (s *Server) reuseOrCreateActing(code string) (*store.Device, *store.DmsClaim, error) {
+	s.dropRetiredPeers()
+	claims, err := s.st.DmsClaims()
+	if err != nil {
+		return nil, nil, err
+	}
+	var keep *store.DmsClaim
+	for i := range claims {
+		if !claims[i].Claimed {
+			continue
+		}
+		if claims[i].Role == "head" {
+			keep = &claims[i]
+			break
+		}
+		if claims[i].Role == "acting" && keep == nil {
+			keep = &claims[i]
+		}
+	}
+	if keep == nil {
+		return s.ensureClaim("acting", "Screen", nil)
+	}
+	keepID := keep.LocalDeviceID
+	keep.Role = "acting"
+	keep.Code = code
+	keep.Claimed = true
+	if err := s.st.SaveDmsClaim(*keep); err != nil {
+		return nil, nil, err
+	}
+	for i := range claims {
+		if claims[i].LocalDeviceID == keepID || !claims[i].Claimed {
+			continue
+		}
+		if claims[i].Role != "head" && claims[i].Role != "acting" {
+			continue
+		}
+		claims[i].Claimed = false
+		claims[i].Role = "retired"
+		_ = s.st.SaveDmsClaim(claims[i])
+		_ = s.st.Unassign(claims[i].LocalDeviceID)
+	}
+	dev, err := s.st.DeviceByID(keepID)
+	if err != nil {
+		return nil, nil, err
+	}
+	saved, err := s.st.DmsClaimByDevice(keepID)
+	return dev, saved, err
+}
+
+// servingClaim is who this CMS uses for join. A local head row that DMS
+// says is not the branch head must not hide the acting row.
+func (s *Server) servingClaim(client *dms.Client) (*store.DmsClaim, dms.Role, bool, bool) {
+	s.dropRetiredPeers()
+	head, err := s.st.DmsClaimByRole("head")
+	if err == nil && head != nil && head.Claimed {
+		role, err := client.Role(head.Code)
+		if err != nil {
+			return nil, dms.Role{}, false, false
+		}
+		if role.IsHead {
+			return head, role, false, true
+		}
+		act, role, ok := s.useActing(client, head)
+		if !ok {
+			return nil, dms.Role{}, false, false
+		}
+		return act, role, true, true
+	}
+	act, role, ok := s.useActing(client, nil)
+	if !ok {
+		return nil, dms.Role{}, false, false
+	}
+	return act, role, true, true
+}
+
+func (s *Server) useActing(client *dms.Client, staleHead *store.DmsClaim) (*store.DmsClaim, dms.Role, bool) {
+	act, err := s.st.DmsClaimByRole("acting")
+	if err != nil || act == nil || !act.Claimed {
+		return nil, dms.Role{}, false
+	}
+	role, err := client.Role(act.Code)
+	if err != nil || !role.IsActing || role.ActingDeviceID != role.DeviceID {
+		return nil, dms.Role{}, false
+	}
+	if staleHead != nil && staleHead.LocalDeviceID != act.LocalDeviceID {
+		staleHead.Claimed = false
+		staleHead.Role = "retired"
+		_ = s.st.SaveDmsClaim(*staleHead)
+		_ = s.st.Unassign(staleHead.LocalDeviceID)
+	}
+	return act, role, true
 }
 
 func claimCodeBody(r *http.Request) (string, bool) {
@@ -191,8 +340,8 @@ func (s *Server) ensureClaim(role, name string, token *string) (*store.Device, *
 			}
 		}
 	}
-	if role == "head" {
-		claim, err := s.st.DmsClaimByRole("head")
+	if role == "head" || role == "acting" {
+		claim, err := s.st.DmsClaimByRole(role)
 		if err != nil {
 			return nil, nil, err
 		}

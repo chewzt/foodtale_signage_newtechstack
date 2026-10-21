@@ -9,6 +9,13 @@ data class Beacon(
     val cmsId: String,
     val http: String,
     val clockPort: Int,
+    val role: String = "",
+    val originCmsId: String = "",
+)
+
+data class FailoverNotice(
+    val originCmsId: String,
+    val dmsDeviceId: Long,
 )
 
 data class Peer(val id: Long, val name: String, val ip: String = "")

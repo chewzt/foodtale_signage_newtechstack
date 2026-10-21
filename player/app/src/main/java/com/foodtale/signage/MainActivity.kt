@@ -37,6 +37,7 @@ class MainActivity : AppCompatActivity() {
     private val main = Handler(Looper.getMainLooper())
     private var splashDone = false
     private val api = CmsApi()
+    private val tempHead = TempHead()
     private lateinit var clock: ClockClient
     private var bus: PlayBus? = null
     private var beacon: BeaconListener? = null
@@ -314,14 +315,10 @@ class MainActivity : AppCompatActivity() {
 
     private fun applyRole() {
         if (!BuildConfig.START_CMS) return
+        if (Prefs.acting()) return
         if (!roleKnown && headSettled()) {
             roleKnown = true
             knownHead = true
-            return
-        }
-        if (!roleKnown && followerSettled()) {
-            roleKnown = true
-            knownHead = false
             return
         }
         if (roleMatches()) return
@@ -361,6 +358,7 @@ class MainActivity : AppCompatActivity() {
         val role = api.claimRole(dms, code)
         roleAsked = true
         roleKnown = true
+        Prefs.dmsDeviceId(role.optLong("device_id"))
         knownHead = role.optBoolean("is_head")
         knownHeadId = role.optLong("head_device_id")
         knownHeadName = role.optString("head_device_name")
@@ -380,6 +378,7 @@ class MainActivity : AppCompatActivity() {
         if (token.isBlank()) return
         Prefs.http("http://127.0.0.1:8080")
         Prefs.cmsId(adopted.optString("cms_id"))
+        Prefs.originCmsId(Prefs.cmsId())
         Prefs.token(token)
         Prefs.deviceId(adopted.optLong("device_id"))
         Prefs.deviceName("Head")
@@ -388,13 +387,19 @@ class MainActivity : AppCompatActivity() {
     }
 
     private fun becomeFollower(code: String, headId: Long, headName: String) {
-        if (CmsHost.wanted() || Prefs.deviceName() == "Head" || Prefs.http().contains("127.0.0.1")) {
+        val wasHead = Prefs.deviceName() == "Head"
+        if (CmsHost.wanted() || wasHead || Prefs.http().contains("127.0.0.1")) {
             CmsHost.stop()
             Prefs.token("")
-            Prefs.cmsId("")
+            if (wasHead) {
+                Prefs.cmsId("")
+                Prefs.originCmsId("")
+            }
+            Prefs.acting(false)
+            Prefs.followingActing(false)
             Prefs.etag("")
             Prefs.manifestJson("")
-            Prefs.http("")
+            if (Prefs.http().contains("127.0.0.1")) Prefs.http("")
             Prefs.deviceName("Screen")
             Prefs.followedHeadId(0)
         }
@@ -429,6 +434,8 @@ class MainActivity : AppCompatActivity() {
                 if (token.isBlank()) continue
                 Prefs.http(base)
                 Prefs.cmsId(joined.optString("cms_id"))
+                Prefs.originCmsId(Prefs.cmsId())
+                Prefs.followingActing(false)
                 Prefs.token(token)
                 Prefs.deviceId(joined.optLong("device_id"))
                 Prefs.deviceName("Screen")
@@ -443,6 +450,120 @@ class MainActivity : AppCompatActivity() {
         main.post {
             hideClaimCode()
             setClaimStatus(if (headName.isBlank()) "Looking for the branch host" else "Looking for host $headName")
+        }
+    }
+
+    private fun becomeActing() {
+        val dms = CmsHost.dmsPublicUrl()
+        val code = Prefs.claimCode()
+        val origin = Prefs.originCmsId().ifBlank { Prefs.cmsId() }
+        if (dms.isBlank() || code.isBlank() || origin.isBlank()) {
+            tempHead.retryLater()
+            return
+        }
+        try {
+            api.claimActing(dms, code)
+        } catch (e: Exception) {
+            val msg = e.message.orEmpty()
+            if (msg.contains("already has a temp head") || msg.contains("Head is still reporting") || msg.contains("cannot become")) {
+                releaseLocalActing()
+            }
+            tempHead.retryLater()
+            return
+        }
+        tempHead.claimAccepted()
+        Prefs.acting(true)
+        Prefs.followingActing(false)
+        CmsHost.start(this)
+        if (!waitForCms()) {
+            failActing(dms, code)
+            return
+        }
+        try {
+            val adopted = api.adoptActing("http://127.0.0.1:8080", code, origin)
+            val token = adopted.optString("device_token")
+            if (token.isBlank()) {
+                failActing(dms, code)
+                return
+            }
+            Prefs.http("http://127.0.0.1:8080")
+            Prefs.token(token)
+            Prefs.deviceId(adopted.optLong("device_id"))
+            Prefs.deviceName("Screen")
+            Prefs.etag("")
+            main.post { if (claimRunning) showPlayer() }
+        } catch (_: Exception) {
+            failActing(dms, code)
+        }
+    }
+
+    private fun failActing(dms: String, code: String) {
+        try {
+            api.clearActing(dms, code)
+        } catch (_: Exception) {
+        }
+        CmsHost.stop()
+        Prefs.acting(false)
+        tempHead.retryLater()
+    }
+
+    private fun releaseLocalActing() {
+        CmsHost.stop()
+        Prefs.acting(false)
+        Prefs.followingActing(false)
+        Prefs.token("")
+        Prefs.etag("")
+        Prefs.manifestJson("")
+        session?.dropManifest()
+    }
+
+    private fun handback(target: HostTarget) {
+        val dms = CmsHost.dmsPublicUrl()
+        val code = Prefs.claimCode()
+        if (Prefs.acting() && dms.isNotBlank() && code.isNotBlank()) {
+            try {
+                api.clearActing(dms, code)
+            } catch (_: Exception) {
+            }
+        }
+        CmsHost.stop()
+        Prefs.acting(false)
+        Prefs.followingActing(false)
+        Prefs.token("")
+        Prefs.etag("")
+        Prefs.manifestJson("")
+        session?.dropManifest()
+        Prefs.http(target.http)
+        Prefs.deviceName("Screen")
+        clock.setPort(target.clockPort)
+        knownHead = false
+        roleKnown = true
+        becomeFollower(code, Prefs.headDeviceId(), knownHeadName)
+    }
+
+    private fun rejoinAt(target: HostTarget, keepCmsId: Boolean, following: Boolean) {
+        val code = Prefs.claimCode()
+        if (code.isBlank() || target.http.isBlank()) return
+        try {
+            val joined = api.joinClaim(target.http, code)
+            val token = joined.optString("device_token")
+            if (token.isBlank()) return
+            Prefs.http(target.http)
+            Prefs.token(token)
+            Prefs.deviceId(joined.optLong("device_id"))
+            Prefs.deviceName("Screen")
+            Prefs.etag("")
+            if (!keepCmsId) {
+                Prefs.cmsId(joined.optString("cms_id"))
+                Prefs.originCmsId(Prefs.cmsId())
+            }
+            Prefs.followingActing(following)
+            Prefs.acting(false)
+            Prefs.manifestJson("")
+            session?.dropManifest()
+            clock.setPort(target.clockPort)
+            main.post { if (claimRunning) showPlayer() }
+        } catch (_: Exception) {
         }
     }
 
@@ -507,6 +628,7 @@ class MainActivity : AppCompatActivity() {
             }
             Prefs.http(base)
             Prefs.cmsId(result.optString("cms_id"))
+            Prefs.originCmsId(Prefs.cmsId())
             Prefs.token(token)
             Prefs.deviceId(result.optLong("device_id"))
             Prefs.deviceName(if (BuildConfig.START_CMS) "Head" else "Screen")
@@ -551,6 +673,10 @@ class MainActivity : AppCompatActivity() {
     private fun dropPairing() {
         Prefs.token("")
         Prefs.cmsId("")
+        Prefs.originCmsId("")
+        Prefs.dmsDeviceId(0)
+        Prefs.acting(false)
+        Prefs.followingActing(false)
         Prefs.deviceId(0)
         Prefs.etag("")
         Prefs.manifestJson("")
@@ -631,16 +757,20 @@ class MainActivity : AppCompatActivity() {
         clock.restore()
         api.parseCached(Prefs.manifestJson())?.let { session?.applyManifest(it) }
         updateSplash()
-        beacon = BeaconListener { b ->
-            // Same CMS only: its beacon may refresh this box's saved URL when the
-            // LAN address changes. Which branch this screen belongs to is decided
-            // by DMS at join, not by comparing CMS ids.
-            if (Prefs.cmsId().isNotBlank() && b.cmsId != Prefs.cmsId()) return@BeaconListener
-            if (!httpOk || Prefs.http() != b.http) {
-                Prefs.http(b.http)
-                clock.setPort(b.clockPort)
-            }
-        }.also { it.start() }
+        beacon = BeaconListener(
+            onBeacon = { b ->
+                tempHead.noteBeacon(b)
+                val origin = Prefs.originCmsId().ifBlank { Prefs.cmsId() }
+                val fromOrigin = b.role != "acting" && (origin.isBlank() || b.cmsId == origin)
+                val drifted = origin.isNotBlank() && Prefs.cmsId().isNotBlank() && Prefs.cmsId() != origin
+                if (!fromOrigin || Prefs.acting() || Prefs.followingActing() || drifted) return@BeaconListener
+                if (!httpOk || Prefs.http() != b.http) {
+                    Prefs.http(b.http)
+                    clock.setPort(b.clockPort)
+                }
+            },
+            onFailover = { notice -> tempHead.noteFailover(notice) },
+        ).also { it.start() }
         startLoops()
     }
 
@@ -748,9 +878,32 @@ class MainActivity : AppCompatActivity() {
         worker = Thread {
             var n = 0
             var lastClock = 0L
+            var actingResumed = false
             while (running) {
                 val now = System.currentTimeMillis()
                 try {
+                    if (n % 7 == 0 && Prefs.paired() && Prefs.deviceName() != "Head" && Prefs.claimCode().isNotBlank()) {
+                        val dms = CmsHost.dmsPublicUrl()
+                        if (dms.isNotBlank()) {
+                            try {
+                                val role = api.claimRole(dms, Prefs.claimCode())
+                                val actingId = role.optLong("acting_device_id")
+                                tempHead.noteRole(actingId)
+                                if (Prefs.dmsDeviceId() == 0L) Prefs.dmsDeviceId(role.optLong("device_id"))
+                                if (Prefs.acting() && CmsHost.wanted() && actingId != Prefs.dmsDeviceId()) {
+                                    releaseLocalActing()
+                                }
+                            } catch (_: PairingRevoked) {
+                                main.post { dropPairing() }
+                                return@Thread
+                            } catch (_: Exception) {
+                            }
+                        }
+                    }
+                    if (Prefs.acting() && !CmsHost.wanted() && (!actingResumed || tempHead.retryDue())) {
+                        actingResumed = true
+                        becomeActing()
+                    }
                     val playing = session?.playing == true
                     val settling = session?.settling == true
                     val clockEveryMs = when {
@@ -777,7 +930,9 @@ class MainActivity : AppCompatActivity() {
                                 session?.statusQuery().orEmpty(),
                             )
                             httpOk = true
-                            if (man != null && man.cmsId.isNotBlank() && man.cmsId != Prefs.cmsId()) {
+                            val foreignCms = man != null && man.cmsId.isNotBlank() && man.cmsId != Prefs.cmsId()
+                                && !Prefs.acting() && !Prefs.followingActing()
+                            if (foreignCms) {
                                 httpOk = false
                             } else {
                                 if (man != null && !man.branchIsHead && Prefs.deviceName() == "Head" && CmsHost.wanted()) {
@@ -802,6 +957,35 @@ class MainActivity : AppCompatActivity() {
                     main.post { session?.tickPlayBus() }
                     if (n % 16 == 0) {
                         session?.tickCms()
+                        if (Prefs.dmsDeviceId() == 0L && Prefs.claimCode().isNotBlank()) {
+                            val dms = CmsHost.dmsPublicUrl()
+                            if (dms.isNotBlank()) {
+                                try {
+                                    val role = api.claimRole(dms, Prefs.claimCode())
+                                    Prefs.dmsDeviceId(role.optLong("device_id"))
+                                    if (Prefs.originCmsId().isBlank() && Prefs.cmsId().isNotBlank()) {
+                                        Prefs.originCmsId(Prefs.cmsId())
+                                    }
+                                } catch (_: PairingRevoked) {
+                                    main.post { dropPairing() }
+                                    return@Thread
+                                } catch (_: Exception) {
+                                }
+                            }
+                        }
+                    }
+                    tempHead.noteHttp(httpOk)
+                    tempHead.tick()
+                    val back = tempHead.takeHandback()
+                    if (back.http.isNotBlank()) {
+                        handback(back)
+                    } else {
+                        val join = tempHead.takeJoin()
+                        if (join.http.isNotBlank()) {
+                            rejoinAt(join, keepCmsId = true, following = true)
+                        } else if (tempHead.consumeStart()) {
+                            becomeActing()
+                        }
                     }
                     if (n % 100 == 0 && Prefs.http().isNotBlank()) {
                         try {
