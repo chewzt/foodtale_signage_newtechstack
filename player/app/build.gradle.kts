@@ -11,8 +11,8 @@ android {
         applicationId = "com.foodtale.signage"
         minSdk = 24
         targetSdk = 35
-        versionCode = 62
-        versionName = "0.2.61"
+        versionCode = 67
+        versionName = "0.2.66"
     }
 
     flavorDimensions += "role"
@@ -24,6 +24,8 @@ android {
         }
         create("cms") {
             dimension = "role"
+            versionName = "0.3.8-test"
+            versionCode = 76
             buildConfigField("boolean", "START_CMS", "true")
             buildConfigField("String", "DMS_PUBLIC_URL", "\"\"")
         }
@@ -76,6 +78,7 @@ android {
     packaging {
         jniLibs {
             useLegacyPackaging = true
+            excludes += "**/libfoodtale_cms.so"
         }
     }
 }
@@ -102,7 +105,7 @@ tasks.configureEach {
     if (name == "preCmsDebugBuild" || name == "preCmsReleaseBuild" ||
         name == "preCmsSitDebugBuild" || name == "preCmsSitReleaseBuild"
     ) {
-        dependsOn(buildCms)
+        // Feasibility build runs the shop server in Kotlin. Do not compile the Go CMS.
     }
 }
 

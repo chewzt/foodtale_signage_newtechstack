@@ -18,7 +18,7 @@ class CmsApi {
 
     fun health(base: String): JSONObject {
         val req = Request.Builder().url("${base.trimEnd('/')}/api/health").get().build()
-        http.newCall(req).execute().use { resp ->
+        call(req).execute().use { resp ->
             val body = resp.body?.string().orEmpty()
             if (!resp.isSuccessful) error("health ${resp.code}")
             return JSONObject(body)
@@ -35,7 +35,7 @@ class CmsApi {
             .url("${base.trimEnd('/')}/api/claims/${code.trim().uppercase()}/role")
             .get()
             .build()
-        http.newCall(req).execute().use { resp ->
+        call(req).execute().use { resp ->
             val body = resp.body?.string().orEmpty()
             if (resp.code == 404) throw PairingRevoked()
             if (!resp.isSuccessful) error(body.ifBlank { "role ${resp.code}" })
@@ -54,7 +54,7 @@ class CmsApi {
             .url("${base.trimEnd('/')}/api/claims")
             .post(payload.toRequestBody("application/json".toMediaType()))
             .build()
-        http.newCall(req).execute().use { resp ->
+        call(req).execute().use { resp ->
             val body = resp.body?.string().orEmpty()
             if (!resp.isSuccessful) error(body.ifBlank { "claim ${resp.code}" })
         }
@@ -122,12 +122,14 @@ class CmsApi {
     }
 
     private fun readJson(req: Request, label: String): JSONObject {
-        http.newCall(req).execute().use { resp ->
+        call(req).execute().use { resp ->
             val body = resp.body?.string().orEmpty()
             if (!resp.isSuccessful) error(body.ifBlank { "$label ${resp.code}" })
             return JSONObject(body)
         }
     }
+
+    private fun call(req: Request) = http.newCall(req).also { it.timeout().timeout(8, TimeUnit.SECONDS) }
 
     fun pair(base: String, code: String, name: String): JSONObject {
         val payload = JSONObject()
@@ -138,7 +140,7 @@ class CmsApi {
             .url("${base.trimEnd('/')}/api/pair")
             .post(payload.toRequestBody("application/json".toMediaType()))
             .build()
-        http.newCall(req).execute().use { resp ->
+        call(req).execute().use { resp ->
             val body = resp.body?.string().orEmpty()
             if (!resp.isSuccessful) error(body.ifBlank { "pair ${resp.code}" })
             return JSONObject(body)
@@ -159,7 +161,7 @@ class CmsApi {
         if (etag.isNotBlank()) {
             reqBuilder.header("If-None-Match", etag)
         }
-        http.newCall(reqBuilder.build()).execute().use { resp ->
+        call(reqBuilder.build()).execute().use { resp ->
             if (resp.code == 304) return null
             val body = resp.body?.string().orEmpty()
             if (resp.code == 401) throw PairingRevoked()
@@ -184,14 +186,14 @@ class CmsApi {
             .header("Authorization", "Bearer $token")
             .post(payload.toString().toRequestBody("application/json".toMediaType()))
             .build()
-        http.newCall(req).execute().use { resp ->
+        call(req).execute().use { resp ->
             return resp.isSuccessful
         }
     }
 
     fun appVersion(base: String): JSONObject {
         val req = Request.Builder().url("${base.trimEnd('/')}/api/app/version").get().build()
-        http.newCall(req).execute().use { resp ->
+        call(req).execute().use { resp ->
             val body = resp.body?.string().orEmpty()
             if (!resp.isSuccessful) error("version ${resp.code}")
             return JSONObject(body)

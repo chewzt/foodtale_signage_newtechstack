@@ -411,7 +411,7 @@ class MainActivity : AppCompatActivity() {
             }
             return
         }
-        if (!claimRunning) {
+        if (!claimRunning && !Prefs.paired()) {
             main.post { showClaim() }
         }
         val remembered = Prefs.http().trimEnd('/')
@@ -432,10 +432,25 @@ class MainActivity : AppCompatActivity() {
                 val joined = api.joinClaim(base, code)
                 val token = joined.optString("device_token")
                 if (token.isBlank()) continue
+                val joinedCms = joined.optString("cms_id")
+                val origin = Prefs.originCmsId().ifBlank { Prefs.cmsId() }
+                val actingHost = origin.isNotBlank() && joinedCms.isNotBlank() && joinedCms != origin
                 Prefs.http(base)
-                Prefs.cmsId(joined.optString("cms_id"))
-                Prefs.originCmsId(Prefs.cmsId())
-                Prefs.followingActing(false)
+                if (actingHost) {
+                    Prefs.followingActing(true)
+                } else if (origin.isBlank()) {
+                    val kept = Prefs.cmsId()
+                    if (kept.isNotBlank() && joinedCms != kept) {
+                        Prefs.originCmsId(kept)
+                        Prefs.followingActing(true)
+                    } else {
+                        Prefs.cmsId(joinedCms)
+                        Prefs.originCmsId(joinedCms)
+                        Prefs.followingActing(false)
+                    }
+                } else {
+                    Prefs.followingActing(joinedCms != origin)
+                }
                 Prefs.token(token)
                 Prefs.deviceId(joined.optLong("device_id"))
                 Prefs.deviceName("Screen")

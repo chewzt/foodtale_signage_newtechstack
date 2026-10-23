@@ -164,6 +164,17 @@ class PlayerEngine(
         return false
     }
 
+    fun handoff(file: File, still: Boolean = false, loop: Boolean = false): Boolean {
+        if (start(file, still, loop)) return true
+        if (still || Looper.myLooper() != Looper.getMainLooper()) return false
+        val uri = front.currentMediaItem?.localConfiguration?.uri
+        if (!front.isPlaying && uri == Uri.fromFile(file)) return false
+        front.playWhenReady = false
+        front.pause()
+        load(front, file)
+        return false
+    }
+
     fun holdLastFrame(): Boolean {
         if (Looper.myLooper() != Looper.getMainLooper()) return false
         if (showingStill) {

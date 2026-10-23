@@ -1,22 +1,20 @@
 package com.foodtale.signage
 
 import android.content.Context
-import android.net.ConnectivityManager
 import android.util.Log
 import java.io.File
-import java.net.Inet4Address
 import java.net.InetSocketAddress
 import java.net.Socket
 
 /**
- * Starts the Go CMS only while this device is the branch head.
- * A second start does nothing while 8080 is already open.
+ * Starts the in-process shop server while this device is Head or Temp Head.
+ * Followers still call 127.0.0.1:8080 on the host and the LAN address from the beacon.
  */
 object CmsHost {
     private const val TAG = "CmsHost"
     private val gate = Any()
     @Volatile private var want = false
-    private var child: Process? = null
+    private var shop: ShopServer? = null
     private var thread: Thread? = null
     private var app: Context? = null
 
@@ -31,8 +29,8 @@ object CmsHost {
                     try {
                         if (!want) {
                             stopChild()
-                        } else if (child?.isAlive != true && !portOpen()) {
-                            child = launch(ctx)
+                        } else if (shop == null && !portOpen()) {
+                            launch(ctx)
                         }
                     } catch (e: Exception) {
                         Log.e(TAG, "cms start failed", e)
@@ -59,62 +57,17 @@ object CmsHost {
     }
 
     private fun stopChild() {
-        val proc = child
-        child = null
-        proc?.destroy()
-        if (proc?.isAlive == true) proc.destroyForcibly()
+        val running = shop
+        shop = null
+        running?.stop()
     }
 
-    private fun launch(context: Context): Process? {
-        if (portOpen()) return null
-        val lib = File(context.applicationInfo.nativeLibraryDir, "libfoodtale_cms.so")
-        if (!lib.exists()) {
-            Log.e(TAG, "missing ${lib.absolutePath}")
-            return null
-        }
-        val dir = File(context.filesDir, "cms")
-        dir.mkdirs()
-        val preset = Prefs.installationId()
-        if (preset.isNotBlank()) writeIdIfMissing(dir, preset)
-        File(dir, "media").mkdirs()
-        File(dir, "public").mkdirs()
-        adoptShellData(dir)
-        val env = mutableMapOf<String, String>()
-        env["DATA_DIR"] = dir.absolutePath
-        env["HTTP_PORT"] = "8080"
-        env["CLOCK_PORT"] = "8123"
-        env["BEACON_PORT"] = "48720"
-        val saved = readEnvFile(File("/data/local/tmp/foodtale/cms.env"))
-        saved["CMS_ID"]?.let { writeIdIfMissing(dir, it) }
-        saved["ADMIN_PASSWORD"]?.let { env["ADMIN_PASSWORD"] = it }
-        val baked = BuildConfig.DMS_PUBLIC_URL.trim().trimEnd('/')
-        if (baked.isNotEmpty()) {
-            env["DMS_PUBLIC_URL"] = baked
-        } else {
-            saved["DMS_PUBLIC_URL"]?.let { env["DMS_PUBLIC_URL"] = it }
-        }
-        advertiseHttp(context)?.let { env["HTTP_ADVERTISE"] = it }
-        val dns = dnsServers(context).ifBlank { "1.1.1.1,8.8.8.8" }
-        env["RESOLV_NAMESERVERS"] = dns
-        Log.i(TAG, "dns $dns")
-        readId(dir)?.let { env["CMS_ID"] = it }
-        val pb = ProcessBuilder(lib.absolutePath)
-        pb.environment().putAll(env)
-        pb.redirectErrorStream(true)
-        pb.redirectOutput(ProcessBuilder.Redirect.appendTo(File(dir, "cms.log")))
-        val child = pb.start()
-        Log.i(TAG, "cms started data=${dir.absolutePath}")
-        return child
-    }
-
-    private fun advertiseHttp(context: Context): String? {
-        val cm = context.getSystemService(ConnectivityManager::class.java) ?: return null
-        val props = cm.getLinkProperties(cm.activeNetwork ?: return null) ?: return null
-        val ip = props.linkAddresses.firstOrNull { link ->
-            val addr = link.address
-            addr is Inet4Address && !addr.isLoopbackAddress && !addr.isLinkLocalAddress
-        }?.address?.hostAddress ?: return null
-        return "http://$ip:8080"
+    private fun launch(context: Context) {
+        if (portOpen()) return
+        val server = ShopServer(context.applicationContext)
+        server.start()
+        shop = server
+        Log.i(TAG, "shop server started")
     }
 
     private fun portOpen(): Boolean {
@@ -126,46 +79,6 @@ object CmsHost {
         } catch (_: Exception) {
             false
         }
-    }
-
-    private fun adoptShellData(dir: File) {
-        if (File(dir, "cms.db").exists()) return
-        val src = File("/data/local/tmp/foodtale")
-        val db = File(src, "cms.db")
-        if (!db.canRead()) return
-        copyIfAbsent(db, File(dir, "cms.db"))
-        copyIfAbsent(File(src, "cms.id"), File(dir, "cms.id"))
-        val media = File(src, "media")
-        media.listFiles()?.forEach { f ->
-            if (f.isFile && f.canRead()) copyIfAbsent(f, File(dir, "media/${f.name}"))
-        }
-    }
-
-    private fun copyIfAbsent(src: File, dest: File) {
-        if (!src.isFile || !src.canRead() || dest.exists()) return
-        dest.parentFile?.mkdirs()
-        src.copyTo(dest, overwrite = false)
-    }
-
-    private fun dnsServers(context: Context): String {
-        val cm = context.getSystemService(ConnectivityManager::class.java) ?: return ""
-        val props = cm.getLinkProperties(cm.activeNetwork ?: return "") ?: return ""
-        return props.dnsServers.mapNotNull { addr ->
-            addr.hostAddress?.substringBefore('%')?.takeIf { it.isNotBlank() }
-        }.distinct().joinToString(",")
-    }
-
-    private fun readId(dir: File): String? {
-        val f = File(dir, "cms.id")
-        if (!f.canRead()) return null
-        val id = f.readText().trim()
-        return id.ifBlank { null }
-    }
-
-    private fun writeIdIfMissing(dir: File, id: String) {
-        val f = File(dir, "cms.id")
-        if (f.exists() || id.isBlank()) return
-        f.writeText(id.trim() + "\n")
     }
 
     private fun readEnvFile(file: File): Map<String, String> {

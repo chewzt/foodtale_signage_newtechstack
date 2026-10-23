@@ -63,6 +63,7 @@ class WallSession(
     private var pulseRun: Runnable? = null
     private var soughtThisPlay = false
     private var appliedSpeed = 1f
+    private var chasedThisPlay = false
     private var stallResumes = 0
     private var learnedLead = Prefs.playbackLead().coerceIn(0L, LEAD_CAP_MS)
     private var leadThisPlay = 0L
@@ -80,6 +81,7 @@ class WallSession(
         const val CUT_PAD_MS = 180L
         const val MISS_SLACK_MS = 40L
         const val NUDGE_MS = 50L
+        const val OPENING_BIND_MS = 80L
         const val SEEK_MS = 800L
         const val LEAD_CAP_MS = 400L
         const val LEAD_STEP_MS = 8L
@@ -95,7 +97,8 @@ class WallSession(
         if (m.items.isNotEmpty()) Prefs.manifestJson(m.toJson().toString())
         onMain {
             Prefs.deviceId(m.deviceId)
-            val origin = Prefs.originCmsId()
+            val saved = Prefs.cmsId()
+            val origin = Prefs.originCmsId().ifBlank { saved }
             if (m.cmsId.isNotBlank() && (origin.isBlank() || m.cmsId == origin)) {
                 Prefs.cmsId(m.cmsId)
             }
@@ -420,7 +423,7 @@ class WallSession(
                     isHold(index) -> engine.holdLastFrame() || engine.showGap()
                     else -> {
                         val file = fileFor(index)
-                        file != null && engine.start(file, isStill(index), isLoop(index))
+                        file != null && engine.handoff(file, isStill(index), isLoop(index))
                     }
                 }
                 if (!started) {
@@ -435,6 +438,7 @@ class WallSession(
                 holdingLateJoin = false
                 soughtThisPlay = false
                 appliedSpeed = 1f
+                chasedThisPlay = false
                 stallResumes = 0
                 openingSampled = false
                 lateThisPlay = late.coerceAtLeast(0L)
@@ -638,11 +642,19 @@ class WallSession(
             timeline in OPENING_HOLD_MS..SETTLE_UNTIL_MS &&
             pos >= 0L &&
             kotlin.math.abs(driftNow) <= SEEK_MS &&
-            lateThisPlay <= 120L
+            lateThisPlay <= LEAD_CAP_MS
         ) {
             noteOpening(driftNow)
         }
         if (timeline < OPENING_HOLD_MS) {
+            if (driftNow <= -OPENING_BIND_MS && !soughtThisPlay && pos >= 0L &&
+                kotlin.math.abs(driftNow) <= SEEK_MS && lateThisPlay <= LEAD_CAP_MS
+            ) {
+                if (!openingSampled) noteOpening(driftNow)
+                engine.seekTo(timeline.coerceAtLeast(0L))
+                soughtThisPlay = true
+                lastDrop = "seek ${driftNow}ms"
+            }
             if (appliedSpeed != 1f) {
                 engine.setSpeed(1f)
                 appliedSpeed = 1f
@@ -672,6 +684,7 @@ class WallSession(
             lastDrop = "seek ${drift}ms"
         }
         if (appliedSpeed != speed) {
+            if (speed > 1f) chasedThisPlay = true
             engine.setSpeed(speed)
             appliedSpeed = speed
         }
@@ -683,9 +696,10 @@ class WallSession(
         if (kotlin.math.abs(drift) > SEEK_MS) return
         val target = (leadThisPlay - drift).coerceIn(0L, LEAD_CAP_MS)
         val gap = target - learnedLead
-        val cold = learnedLead < 40L && kotlin.math.abs(gap) > LEAD_STEP_MS
-        val step = if (kotlin.math.abs(gap) > LEAD_FAST_GAP_MS || cold) {
-            (gap / 2).coerceIn(-LEAD_FAST_CAP_MS, LEAD_FAST_CAP_MS)
+        if (drift > 0 && chasedThisPlay) return
+        val cold = learnedLead < 40L && gap > LEAD_STEP_MS
+        val step = if (gap > LEAD_FAST_GAP_MS || cold) {
+            (gap / 2).coerceIn(0L, LEAD_FAST_CAP_MS)
         } else {
             gap.coerceIn(-LEAD_STEP_MS, LEAD_STEP_MS)
         }
@@ -767,7 +781,9 @@ class WallSession(
         val file = fileFor(idx)
         val lead = when {
             isHold(idx) || isGap(idx) -> 0L
-            file != null && engine.canStart(file, isStill(idx)) -> learnedLead
+            file == null -> 0L
+            !isStill(idx) -> learnedLead
+            engine.canStart(file, true) -> learnedLead
             else -> 0L
         }
         leadThisPlay = lead

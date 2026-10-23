@@ -40,11 +40,26 @@ class ClockClient(
             val json = JSONObject(String(pkt.data, 0, pkt.length, StandardCharsets.UTF_8))
             val tMaster = json.optLong("tMaster")
             val t2send = json.optLong("t2send")
-            offsetMs = ((tMaster - t1) + (t2send - t3)) / 2
-            rttMs = t3 - t1
+            val next = ((tMaster - t1) + (t2send - t3)) / 2
+            val rtt = t3 - t1
+            if (!accept(next, rtt, t3)) return
+            offsetMs = next
+            rttMs = rtt
             lastOkAt = t3
+            rejectSince = 0L
             Prefs.saveClock(offsetMs, rttMs)
         }
+    }
+
+    private var rejectSince = 0L
+
+    private fun accept(next: Long, rtt: Long, now: Long): Boolean {
+        val locked = lastOkAt != 0L
+        val jump = kotlin.math.abs(next - offsetMs)
+        val clean = rtt <= 40L && (!locked || jump <= 20L || rtt <= 12L)
+        if (clean) return true
+        if (rejectSince == 0L) rejectSince = now
+        return now - rejectSince >= 15_000L
     }
 
     fun restore() {
